@@ -19,7 +19,7 @@ just plan snapshots/example-site.json /path/to/inventory.yml out/example-site
 当监控的 `site` 与 NetBox 站点 slug 不同，使用 `just plan-for <netbox-site> <snapshot> <inventory> <out-dir>` 明确映射。
 
 - `snapshot` 失败时不产生半份快照。输出文件必须是新文件。
-- `plan` 输出 `plan.json`；仅当全部在用设备的名称、投用状态、角色和已有地址等价时，才输出 `inventory.candidate.yml`。不会自动纳管额外设备。
+- `plan` 输出 `plan.json`；仅当全部在用设备的名称、投用状态、角色和已有地址等价时，才输出 `inventory.candidate.yml`。等价候选逐字节保留原清单；不会自动纳管额外设备。
 - 链路目前只报告精确匹配、非在用、端口缺失或对端差异。**候选完整保留已有链路基线**。本版不会根据 NetBox 的缺记录删掉现网链路。
 - `plan` 返回 `0` 表示生成候选，`2` 表示报告已生成但候选被拦截，`1` 表示输入或运行错误。输出目录必须是新目录。
 - 候选是给现有监控生成器审阅的输入；本工具没有 `publish` 命令，不配置定时任务，不热加载服务。
@@ -41,3 +41,20 @@ Docker Hub 的镜像名为 `<Docker Hub 命名空间>/netbox-sync:v0.1.0`。使�
 在 `main` 合并对应版本并更新 `Cargo.toml`、`Cargo.lock` 后，手动触发 `just release v0.1.0`。Workflow 校验版本和源码提交，执行格式、Clippy、测试和隔离镜像检查，再发布 GitHub Release。
 
 已有 Release 的二进制可用 `just publish-images v0.1.0` 打包并推送 Docker Hub 和阿里云 ACR。这一步核对公开二进制包的 SHA-256 和版本，在同一次打包后给同一个 Docker 镜像打两个 registry 标签，不重新编译 Rust。Docker Hub 使用 `DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`；ACR 使用 `ACR_URL`、`ACR_USERNAME`、`ACR_PASSWORD`。`ACR_URL` 只有 registry 主机名时使用 workflow 的命名空间输入。发布过程不使用部署凭据。仓库只包含合成测试数据。
+
+## 站点别名和地址用途
+
+如果库存标签与 NetBox 名称不一致，或者业务拨测不使用 NetBox 的主地址，可将策略文件传给 `plan --policy <policy.yml>`，或运行 `just plan-policy <snapshot> <inventory> <policy> <out-dir>`。策略属于站点部署配置，不能跨站点复用。以下是合成示例：
+
+```yaml
+version: 1
+inventory_site: example-site
+netbox_site: registered-site
+aliases:
+  old-monitoring-label: {device_id: 22, netbox_name: registered-host}
+business_ip_tag_by_role:
+  server: monitoring-biz
+require_oob_roles: [server]
+```
+
+别名要同时匹配站点、NetBox ID 和预期名称，输出继续用原监控标签。配置业务标签的角色必须有且仅有一个绑定在启用接口上的 active IPv4；缺失或歧义会拦截候选。要求 OOB 的角色必须有一个与设备 OOB 地址相符的 active IPv4 绑定。`plan.json` 的 `resolved_devices` 记录选出的地址，供与现网逐项核对；工具不把新字段自动加到已有清单，也不会应用候选。`snapshot` 保存 NetBox IP 的状态及标签。

@@ -1,6 +1,7 @@
 mod model;
 mod netbox;
 mod plan;
+mod policy;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -42,6 +43,9 @@ enum Commands {
         /// Explicit NetBox site slug if it differs from inventory.site.
         #[arg(long)]
         netbox_site: Option<String>,
+        /// Optional site-specific alias and address-purpose policy.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
 }
 
@@ -83,12 +87,20 @@ fn run(c: Cli) -> Result<u8> {
             inventory,
             out_dir,
             netbox_site,
+            policy,
         } => {
             let snapshot: model::Snapshot =
                 serde_json::from_slice(&fs::read(snapshot).context("read snapshot")?)
                     .context("parse snapshot")?;
             let source = fs::read_to_string(inventory).context("read inventory")?;
-            let (report, candidate) = plan::build(&source, &snapshot, netbox_site.as_deref())?;
+            let policy: Option<policy::Policy> = policy
+                .map(|p| -> Result<_> {
+                    serde_yaml_ng::from_str(&fs::read_to_string(p).context("read policy")?)
+                        .context("parse policy YAML")
+                })
+                .transpose()?;
+            let (report, candidate) =
+                plan::build(&source, &snapshot, netbox_site.as_deref(), policy.as_ref())?;
             let builder = fs::DirBuilder::new();
             #[cfg(unix)]
             let builder = {
