@@ -1,0 +1,5 @@
+FROM scratch
+COPY netbox-sync /netbox-sync
+WORKDIR /work
+USER 65532:65532
+ENTRYPOINT ["/netbox-sync"]

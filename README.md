@@ -26,19 +26,18 @@ just plan snapshots/example-site.json /path/to/inventory.yml out/example-site
 
 ## Linux 和 Docker
 
-GitHub Release 提供 Linux amd64 二进制、同版本 Docker 镜像归档及 `SHA256SUMS`。镜像中的二进制与 Release 包取自同一次构建。
+GitHub Release 只提供 Linux amd64 二进制和 `SHA256SUMS`。Docker 镜像只发布到 Docker Hub 和阿里云 ACR，不作为 Release 附件。
 
 ```sh
 sha256sum -c SHA256SUMS
 tar -xzf netbox-sync-v0.1.0-linux-amd64.tar.gz
 ./netbox-sync --help
-
-docker load -i netbox-sync-image-v0.1.0-linux-amd64.tar.gz
-docker run --rm ghcr.io/weironz/netbox-sync:v0.1.0 --help
 ```
 
-处理文件时，将工作目录挂载到 `/work`，Token 文件单独以只读方式挂载；Linux 上可用 `--user "$(id -u):$(id -g)"` 让容器以本地用户权限写候选目录。第一版不提供 Windows 二进制发布包。
+Docker Hub 的镜像名为 `<Docker Hub 命名空间>/netbox-sync:v0.1.0`。使用容器处理文件时，将工作目录挂载到 `/work`，Token 文件单独以只读方式挂载；Linux 上可用 `--user "$(id -u):$(id -g)"` 让容器以本地用户权限写候选目录。第一版不提供 Windows 二进制发布包。
 
 ## 发布
 
-在 `main` 合并对应版本并更新 `Cargo.toml`、`Cargo.lock` 后，手动触发 `just release v0.1.0`。Workflow 校验版本和源码提交，执行格式、Clippy、测试和隔离镜像检查，再发布 GitHub Release；最后尝试推送 GHCR，registry 拒绝不会阻断公开镜像归档下载。仓库只包含合成测试数据。
+在 `main` 合并对应版本并更新 `Cargo.toml`、`Cargo.lock` 后，手动触发 `just release v0.1.0`。Workflow 校验版本和源码提交，执行格式、Clippy、测试和隔离镜像检查，再发布 GitHub Release。
+
+已有 Release 的二进制可用 `just publish-images v0.1.0` 打包并推送 Docker Hub 和阿里云 ACR。这一步核对公开二进制包的 SHA-256 和版本，在同一次打包后给同一个 Docker 镜像打两个 registry 标签，不重新编译 Rust。Docker Hub 使用 `DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`；ACR 使用 `ACR_URL`、`ACR_USERNAME`、`ACR_PASSWORD`。`ACR_URL` 只有 registry 主机名时使用 workflow 的命名空间输入。发布过程不使用部署凭据。仓库只包含合成测试数据。

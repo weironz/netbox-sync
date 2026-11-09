@@ -1,0 +1,66 @@
+name: Publish Docker Hub and ACR images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub binary release tag (for example v0.1.0)
+        required: true
+        type: string
+      acr_namespace:
+        description: ACR namespace when ACR_URL contains only a registry host
+        default: willspace
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-image-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Package the verified release binary in a Docker image
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          archive="netbox-sync-$TAG-linux-amd64.tar.gz"
+          test "$(gh release view "$TAG" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease')" = false
+          gh release download "$TAG" --dir artifact --pattern "$archive" --pattern SHA256SUMS
+          (cd artifact && sha256sum -c SHA256SUMS)
+          mkdir artifact/runtime
+          tar -xOzf "artifact/$archive" netbox-sync > artifact/runtime/netbox-sync
+          chmod 755 artifact/runtime/netbox-sync
+          image="netbox-sync-release:$TAG"
+          docker build --platform linux/amd64 --provenance=false -f Dockerfile.runtime \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$commit" \
+            --label "org.opencontainers.image.version=${TAG#v}" \
+            --tag "$image" artifact/runtime
+          test "$(docker run --rm --network none --read-only --cap-drop ALL "$image" --version)" = "netbox-sync ${TAG#v}"
+          docker image inspect "$image" --format '{{.Id}}' > artifact/image-id.txt
+      - name: Publish to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: bash scripts/publish-image.sh dockerhub
+      - name: Publish to Alibaba Cloud ACR
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          ACR_URL: ${{ secrets.ACR_URL }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          ACR_NAMESPACE: ${{ inputs.acr_namespace }}
+        run: bash scripts/publish-image.sh acr

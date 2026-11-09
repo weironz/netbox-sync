@@ -31,3 +31,6 @@ image tag="netbox-sync:local":
 
 release tag:
     gh workflow run release.yml --ref main -f tag="{{tag}}"
+
+publish-images tag acr_namespace="willspace":
+    gh workflow run publish-images.yml --ref main -f tag="{{tag}}" -f acr_namespace="{{acr_namespace}}"
