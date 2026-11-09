@@ -235,7 +235,7 @@ pub(crate) fn snapshot(url: &str, site: &str, token_file: &Path) -> Result<Snaps
     let mut ips = Vec::new();
     for r in nb.rows(
         "api/ipam/ip-addresses/",
-        "id,address,assigned_object_type,assigned_object_id,vrf",
+        "id,address,assigned_object_type,assigned_object_id,vrf,status,tags",
         None,
     )? {
         let Some(interface) = r["assigned_object_id"].as_u64().filter(|n| ids.contains(n)) else {
@@ -248,6 +248,13 @@ pub(crate) fn snapshot(url: &str, site: &str, token_file: &Path) -> Result<Snaps
             id: id(&r)?,
             address: str_value(&r["address"])?,
             interface_id: interface,
+            status: Some(status(&r["status"])?),
+            tags: r["tags"]
+                .as_array()
+                .context("missing IP tags")?
+                .iter()
+                .map(|t| str_value(&t["slug"]))
+                .collect::<Result<Vec<_>>>()?,
             vrf_id: if r["vrf"].is_null() {
                 None
             } else {

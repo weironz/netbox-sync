@@ -34,3 +34,6 @@ release tag:
 
 publish-images tag acr_namespace="willspace":
     gh workflow run publish-images.yml --ref main -f tag="{{tag}}" -f acr_namespace="{{acr_namespace}}"
+
+plan-policy snapshot inventory policy output_dir:
+    cargo run --locked -- plan --snapshot "{{snapshot}}" --inventory "{{inventory}}" --policy "{{policy}}" --out-dir "{{output_dir}}"

@@ -1,4 +1,7 @@
-use crate::model::{Snapshot, host_address};
+use crate::{
+    model::{Address, Device, Snapshot, host_address},
+    policy::Policy,
+};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_yaml_ng::Value;
@@ -27,9 +30,20 @@ pub(crate) struct Report {
     pub equivalent_devices: usize,
     pub candidate_written: bool,
     pub issues: Vec<Issue>,
+    resolved_devices: Vec<ResolvedDevice>,
     untracked_devices: Vec<String>,
     link_summary: BTreeMap<&'static str, usize>,
     links: Vec<LinkReport>,
+}
+
+#[derive(Serialize)]
+struct ResolvedDevice {
+    host: String,
+    netbox_id: u64,
+    netbox_name: String,
+    used_alias: bool,
+    business_ip: Option<String>,
+    bmc_ip: Option<String>,
 }
 
 fn field<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
@@ -44,12 +58,12 @@ fn address_issue(
     expected: &str,
     observed: Option<&str>,
     issues: &mut Vec<Issue>,
-) -> Result<Option<String>> {
+) -> Result<()> {
     let expected_ip =
         host_address(expected).with_context(|| format!("invalid {name} for {host}"))?;
     let observed_ip = observed.map(host_address).transpose()?;
     if observed_ip == Some(expected_ip) {
-        return Ok(Some(expected_ip.to_string()));
+        return Ok(());
     }
     issues.push(Issue {
         host: host.to_owned(),
@@ -57,10 +71,14 @@ fn address_issue(
         expected: expected.to_owned(),
         observed: observed.map(str::to_owned),
     });
-    Ok(None)
+    Ok(())
 }
 
-fn link_report(doc: &Value, snapshot: &Snapshot) -> Result<Vec<LinkReport>> {
+fn link_report(
+    doc: &Value,
+    snapshot: &Snapshot,
+    aliases: &BTreeMap<u64, String>,
+) -> Result<Vec<LinkReport>> {
     let Some(baseline) = doc.get("port_baseline") else {
         return Ok(Vec::new());
     };
@@ -71,7 +89,7 @@ fn link_report(doc: &Value, snapshot: &Snapshot) -> Result<Vec<LinkReport>> {
     let names: BTreeMap<_, _> = snapshot
         .devices
         .iter()
-        .map(|d| (d.id, d.name.as_str()))
+        .map(|d| (d.id, aliases.get(&d.id).unwrap_or(&d.name).as_str()))
         .collect();
     let endpoints: BTreeMap<_, _> = snapshot
         .interfaces
@@ -146,47 +164,152 @@ fn link_report(doc: &Value, snapshot: &Snapshot) -> Result<Vec<LinkReport>> {
         .collect()
 }
 
+type Aliases<'a> = (BTreeMap<String, &'a Device>, BTreeMap<u64, String>);
+
+fn resolve_aliases<'a>(
+    policy: Option<&Policy>,
+    snapshot: &'a Snapshot,
+    inventory_names: &BTreeSet<String>,
+    known: &BTreeMap<String, &'a Device>,
+) -> Result<Aliases<'a>> {
+    let mut aliases = BTreeMap::new();
+    let mut names = BTreeMap::new();
+    if let Some(policy) = policy {
+        let by_id: BTreeMap<_, _> = snapshot.devices.iter().map(|d| (d.id, d)).collect();
+        for (host, expected) in &policy.aliases {
+            let key = host.to_lowercase();
+            ensure!(
+                inventory_names.contains(&key),
+                "alias host {host} is not in inventory"
+            );
+            let d = by_id.get(&expected.device_id).copied().with_context(|| {
+                format!(
+                    "alias device ID {} is missing at this site",
+                    expected.device_id
+                )
+            })?;
+            ensure!(
+                d.name == expected.netbox_name,
+                "alias {host} points to an unexpected NetBox name"
+            );
+            ensure!(
+                known.get(&key).is_none_or(|direct| direct.id == d.id),
+                "alias {host} conflicts with a directly matching device"
+            );
+            aliases.insert(key, d);
+            names.insert(d.id, host.clone());
+        }
+    }
+    Ok((aliases, names))
+}
+
+fn select_business_ip<'a>(
+    host: &str,
+    d: &'a Device,
+    tag: Option<&str>,
+    addresses: &[(&'a Address, bool)],
+    issues: &mut Vec<Issue>,
+) -> Result<Option<&'a str>> {
+    let Some(tag) = tag else {
+        return Ok(d.primary_ip4.as_deref());
+    };
+    let matches: Vec<_> = addresses
+        .iter()
+        .filter(|(a, _)| a.tags.iter().any(|t| t == tag))
+        .collect();
+    if let [(a, enabled)] = matches.as_slice()
+        && *enabled
+        && a.status.as_deref() == Some("active")
+        && host_address(&a.address)?.is_ipv4()
+    {
+        return Ok(Some(&a.address));
+    }
+    issues.push(Issue {
+        host: host.to_owned(),
+        field: "business_tag",
+        expected: format!("one active IPv4 tagged {tag} on an enabled interface"),
+        observed: Some(format!("{} tagged addresses", matches.len())),
+    });
+    Ok(None)
+}
+
 pub(crate) fn build(
     input: &str,
     snapshot: &Snapshot,
     mapped_site: Option<&str>,
+    policy: Option<&Policy>,
 ) -> Result<(Report, Option<String>)> {
     snapshot.validate()?;
-    let mut doc: Value = serde_yaml_ng::from_str(input).context("parse inventory YAML")?;
+    let doc: Value = serde_yaml_ng::from_str(input).context("parse inventory YAML")?;
     ensure!(
         doc.get("version").and_then(Value::as_u64) == Some(1),
         "unsupported monitoring inventory version"
     );
     let site = field(&doc, "site")?.to_owned();
+    if let Some(p) = policy {
+        p.validate(&site, &snapshot.site.slug)?;
+        ensure!(
+            mapped_site.is_none_or(|m| m == p.netbox_site),
+            "--netbox-site conflicts with the policy"
+        );
+    }
+    let target_site = policy
+        .map(|p| p.netbox_site.as_str())
+        .or(mapped_site)
+        .unwrap_or(&site);
     ensure!(
-        snapshot.site.slug == mapped_site.unwrap_or(&site),
+        snapshot.site.slug == target_site,
         "NetBox site does not match inventory; use --netbox-site for an explicit mapping"
     );
-    let links = link_report(&doc, snapshot)?;
-    let mut link_summary = BTreeMap::new();
-    for l in &links {
-        *link_summary.entry(l.state).or_insert(0) += 1;
-    }
     let known: BTreeMap<_, _> = snapshot
         .devices
         .iter()
         .map(|d| (d.name.to_lowercase(), d))
         .collect();
-    let devices = doc
-        .get_mut("devices")
-        .and_then(Value::as_sequence_mut)
+    let inv = doc
+        .get("devices")
+        .and_then(Value::as_sequence)
         .context("invalid inventory devices")?;
+    let inventory_names = inv
+        .iter()
+        .map(|r| Ok(field(r, "host")?.to_lowercase()))
+        .collect::<Result<BTreeSet<_>>>()?;
+    ensure!(
+        inventory_names.len() == inv.len(),
+        "duplicate inventory device names"
+    );
+    let (aliases, alias_names) = resolve_aliases(policy, snapshot, &inventory_names, &known)?;
+    let links = link_report(&doc, snapshot, &alias_names)?;
+    let mut link_summary = BTreeMap::new();
+    for l in &links {
+        *link_summary.entry(l.state).or_insert(0) += 1;
+    }
+    let interfaces: BTreeMap<_, _> = snapshot.interfaces.iter().map(|i| (i.id, i)).collect();
+    let mut addresses: BTreeMap<u64, Vec<(&Address, bool)>> = BTreeMap::new();
+    for a in &snapshot.ip_addresses {
+        let i = interfaces[&a.interface_id];
+        addresses
+            .entry(i.device_id)
+            .or_default()
+            .push((a, i.enabled));
+    }
     let mut issues = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut matched = BTreeSet::new();
+    let mut resolved_devices = Vec::new();
     let mut expected_devices = 0;
     let mut equivalent_devices = 0;
-    for row in devices {
+    for row in inv {
         let host = field(row, "host")?.to_owned();
         let key = host.to_lowercase();
-        ensure!(
-            seen.insert(key.clone()),
-            "duplicate inventory device {host}"
-        );
+        let selected_alias = aliases.get(&key).copied();
+        let selected = selected_alias.or_else(|| known.get(&key).copied());
+        if let Some(d) = selected {
+            ensure!(
+                matched.insert(d.id),
+                "more than one inventory host maps to NetBox device {}",
+                d.id
+            );
+        }
         let active = row
             .get("active")
             .map(|v| v.as_bool().context("invalid inventory active flag"))
@@ -196,7 +319,7 @@ pub(crate) fn build(
             continue;
         }
         expected_devices += 1;
-        let Some(d) = known.get(&key) else {
+        let Some(d) = selected else {
             issues.push(Issue {
                 host,
                 field: "device",
@@ -206,12 +329,12 @@ pub(crate) fn build(
             continue;
         };
         let start = issues.len();
-        let role = field(row, "role")?;
+        let role = field(row, "role")?.to_owned();
         if d.role != role {
             issues.push(Issue {
                 host: host.clone(),
                 field: "role",
-                expected: role.into(),
+                expected: role.clone(),
                 observed: Some(d.role.clone()),
             });
         }
@@ -223,35 +346,64 @@ pub(crate) fn build(
                 observed: Some(d.status.clone()),
             });
         }
-        for (name, actual) in [
-            ("primary", d.primary_ip4.as_deref()),
-            ("bmc", d.oob_ip.as_deref()),
-        ] {
-            if let Some(v) = row.get(name) {
+        let assigned = addresses.get(&d.id).map(Vec::as_slice).unwrap_or_default();
+        let tag = policy
+            .and_then(|p| p.business_ip_tag_by_role.get(&role))
+            .map(String::as_str);
+        let biz = select_business_ip(&host, d, tag, assigned, &mut issues)?;
+        let bmc = d.oob_ip.as_deref();
+        if policy.is_some_and(|p| p.require_oob_roles.contains(&role)) {
+            let ip = bmc.map(host_address).transpose()?;
+            let mut valid = 0;
+            if let Some(ip) = ip.filter(|i| i.is_ipv4()) {
+                for (a, enabled) in assigned {
+                    if *enabled
+                        && a.status.as_deref() == Some("active")
+                        && host_address(&a.address)? == ip
+                    {
+                        valid += 1;
+                    }
+                }
+            }
+            if valid != 1 {
+                issues.push(Issue {
+                    host: host.clone(),
+                    field: "oob",
+                    expected: "one active assigned IPv4 matching the device OOB IP".into(),
+                    observed: bmc.map(str::to_owned),
+                });
+            }
+        }
+        for (field, actual) in [("primary", biz), ("bmc", bmc)] {
+            if field == "primary" && tag.is_some() && biz.is_none() {
+                continue;
+            }
+            if let Some(v) = row.get(field) {
                 let expected = v
                     .as_str()
-                    .with_context(|| format!("invalid {name} for {host}"))?;
-                if let Some(normalized) = address_issue(&host, name, expected, actual, &mut issues)?
-                {
-                    row[name] = Value::String(normalized);
-                }
+                    .with_context(|| format!("invalid {field} for {host}"))?;
+                address_issue(&host, field, expected, actual, &mut issues)?;
             }
         }
         if start == issues.len() {
             equivalent_devices += 1;
         }
+        resolved_devices.push(ResolvedDevice {
+            host,
+            netbox_id: d.id,
+            netbox_name: d.name.clone(),
+            used_alias: selected_alias.is_some(),
+            business_ip: biz.map(host_address).transpose()?.map(|ip| ip.to_string()),
+            bmc_ip: bmc.map(host_address).transpose()?.map(|ip| ip.to_string()),
+        });
     }
     ensure!(expected_devices > 0, "inventory has no active devices");
     let untracked_devices = known
-        .into_iter()
-        .filter(|(k, _)| !seen.contains(k))
-        .map(|(_, v)| v.name.clone())
+        .into_values()
+        .filter(|d| !matched.contains(&d.id))
+        .map(|d| d.name.clone())
         .collect();
-    let candidate = if issues.is_empty() {
-        Some(serde_yaml_ng::to_string(&doc)?)
-    } else {
-        None
-    };
+    let candidate = issues.is_empty().then(|| input.to_owned());
     let report = Report {
         schema_version: 1,
         site,
@@ -260,6 +412,7 @@ pub(crate) fn build(
         equivalent_devices,
         candidate_written: candidate.is_some(),
         issues,
+        resolved_devices,
         untracked_devices,
         link_summary,
         links,

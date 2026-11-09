@@ -32,6 +32,10 @@ pub(crate) struct Address {
     pub interface_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vrf_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Termination {
