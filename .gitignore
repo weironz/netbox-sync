@@ -1,0 +1,13 @@
+/target/
+/out/
+/snapshots/
+/candidates/
+/.local/
+/.env*
+/secrets/
+*.token
+*.pem
+*.key
+*.candidate.yml
+snapshot*.json
+plan.json
