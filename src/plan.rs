@@ -20,7 +20,17 @@ pub(crate) struct LinkReport {
     b: String,
     review: String,
     state: &'static str,
+    a_observed_peers: Vec<LinkPeer>,
+    b_observed_peers: Vec<LinkPeer>,
+    missing_endpoints: Vec<String>,
+    exact_cable_ids: Vec<u64>,
 }
+#[derive(Clone, Serialize)]
+struct LinkPeer {
+    endpoint: String,
+    cable_id: u64,
+}
+
 #[derive(Serialize)]
 pub(crate) struct Report {
     schema_version: u32,
@@ -30,20 +40,20 @@ pub(crate) struct Report {
     pub equivalent_devices: usize,
     pub candidate_written: bool,
     pub issues: Vec<Issue>,
-    resolved_devices: Vec<ResolvedDevice>,
-    untracked_devices: Vec<String>,
-    link_summary: BTreeMap<&'static str, usize>,
-    links: Vec<LinkReport>,
+    pub resolved_devices: Vec<ResolvedDevice>,
+    pub untracked_devices: Vec<String>,
+    pub link_summary: BTreeMap<&'static str, usize>,
+    pub links: Vec<LinkReport>,
 }
 
 #[derive(Serialize)]
-struct ResolvedDevice {
-    host: String,
+pub(crate) struct ResolvedDevice {
+    pub host: String,
     netbox_id: u64,
     netbox_name: String,
     used_alias: bool,
-    business_ip: Option<String>,
-    bmc_ip: Option<String>,
+    pub business_ip: Option<String>,
+    pub bmc_ip: Option<String>,
 }
 
 fn field<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
@@ -104,6 +114,8 @@ fn link_report(
     let known: BTreeSet<_> = endpoints.values().collect();
     let mut pairs: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
     let mut peers: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    let mut details: BTreeMap<&str, Vec<LinkPeer>> = BTreeMap::new();
+    let mut exact_ids: BTreeMap<(&str, &str), Vec<u64>> = BTreeMap::new();
     for c in &snapshot.cables {
         let ([a], [b]) = (c.a.as_slice(), c.b.as_slice()) else {
             continue;
@@ -119,9 +131,18 @@ fn link_report(
         };
         let p = if a <= b { (a, b) } else { (b, a) };
         pairs.entry(p).or_default().push(&c.status);
+        exact_ids.entry(p).or_default().push(c.id);
         if matches!(c.status.as_str(), "active" | "connected") {
             peers.entry(a).or_default().insert(b);
             peers.entry(b).or_default().insert(a);
+            details.entry(a).or_default().push(LinkPeer {
+                endpoint: b.to_owned(),
+                cable_id: c.id,
+            });
+            details.entry(b).or_default().push(LinkPeer {
+                endpoint: a.to_owned(),
+                cable_id: c.id,
+            });
         }
     }
     links
@@ -159,6 +180,13 @@ fn link_report(
                     .unwrap_or("unspecified")
                     .to_owned(),
                 state,
+                a_observed_peers: details.get(an.as_str()).cloned().unwrap_or_default(),
+                b_observed_peers: details.get(bn.as_str()).cloned().unwrap_or_default(),
+                missing_endpoints: [(a, &an), (b, &bn)]
+                    .into_iter()
+                    .filter_map(|(label, key)| (!known.contains(key)).then_some(label.to_owned()))
+                    .collect(),
+                exact_cable_ids: exact_ids.get(&(ak, bk)).cloned().unwrap_or_default(),
             })
         })
         .collect()

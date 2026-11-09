@@ -24,6 +24,39 @@ just plan snapshots/example-site.json /path/to/inventory.yml out/example-site
 - `plan` 返回 `0` 表示生成候选，`2` 表示报告已生成但候选被拦截，`1` 表示输入或运行错误。输出目录必须是新目录。
 - 候选是给现有监控生成器审阅的输入；本工具没有 `publish` 命令，不配置定时任务，不热加载服务。
 
+### 配置参数
+
+命令行参数与环境变量可混用；显式命令行参数优先。同一个变量可用于相关子命令，不影响已有调用方式。Token 继续从文件读取，`NETBOX_TOKEN_FILE` 只传路径。
+
+| 环境变量 | 命令行参数 |
+| --- | --- |
+| `NETBOX_URL` | `snapshot --netbox-url` |
+| `NETBOX_SITE` | `snapshot --site`、`plan --netbox-site` |
+| `NETBOX_TOKEN_FILE` | `snapshot --token-file` |
+| `NETBOX_SNAPSHOT_FILE` | `snapshot --output`、`plan --snapshot` |
+| `NETBOX_INVENTORY_FILE` | `plan --inventory` |
+| `NETBOX_POLICY_FILE` | `plan --policy` |
+| `NETBOX_PLAN_DIR` | `plan --out-dir` |
+
+## 常驻同步
+
+Linux 上使用 `netbox-sync run`；启动后立即运行一次，然后按周期同步，不需要外部定时器。它用只读 API 拉取快照，校验已批准的库存及渲染模板；只有等价的采集配置才进入已发布版本。输出目录必须提前创建，并持久化。失败时记录原因，保留上一份已发布文件。端口模式默认 `audit`，在 `plan.json` 中提供两端记录、对端和线缆 ID；不发布端口规则。
+
+在上表的 URL、站点、Token 路径、inventory 和 policy 之外，`run` 还使用以下选项。所有显式 CLI 参数优先于同名环境变量。
+
+| 环境变量 | 参数 |
+| --- | --- |
+| `NETBOX_SYNC_INTERVAL` | `--interval`（默认 `1h`，支持 `s/m/h`） |
+| `NETBOX_PORT_MODE` | `--port-mode`（`audit` 或 `off`） |
+| `NETBOX_RENDER_FILE` | `--render-file` |
+| `NETBOX_TEMPLATES_DIR` | `--templates-dir` |
+| `NETBOX_OUTPUT_DIR` | `--output-dir`（状态、快照、报告） |
+| `NETBOX_PROMETHEUS_PUBLISH_DIR` | `--prometheus-publish-dir` |
+| `NETBOX_VMAGENT_PUBLISH_DIR` | `--vmagent-publish-dir` |
+| `NETBOX_RUN_ONCE` | `--once`（默认 `false`） |
+
+`netbox-sync status --output-dir <dir> --max-age 3h` 可用于健康检查。它根据最后一次成功时间返回状态码；`--max-age` 也支持 `NETBOX_MAX_AGE`。两个发布目录各有一个原子更新的 `current` 相对符号链接。采集器只读挂载生成目录，不持有 NetBox Token，也不依赖同步进程在线。
+
 ## Linux 和 Docker
 
 GitHub Release 只提供 Linux amd64 二进制和 `SHA256SUMS`。Docker 镜像只发布到 Docker Hub 和阿里云 ACR，不作为 Release 附件。

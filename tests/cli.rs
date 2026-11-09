@@ -57,6 +57,10 @@ fn equivalent_devices_create_a_candidate_without_removing_a_missing_link() -> an
     assert_eq!(report["candidate_written"], true);
     assert_eq!(report["links"][0]["state"], "interface_missing");
     assert_eq!(
+        report["links"][0]["missing_endpoints"],
+        json!(["host-01/HCA-01"])
+    );
+    assert_eq!(
         fs::read_to_string(dir.path().join("inventory.yml"))?,
         INVENTORY
     );
@@ -195,5 +199,126 @@ fn policy_rejects_an_oob_ip_assigned_to_another_device() -> anyhow::Result<()> {
     let report: Value = serde_json::from_slice(&fs::read(dir.path().join("out/plan.json"))?)?;
     assert_eq!(report["issues"][0]["field"], "oob");
     assert!(!dir.path().join("out/inventory.candidate.yml").exists());
+    Ok(())
+}
+
+#[test]
+fn plan_accepts_environment_and_cli_takes_precedence() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let snapshot = dir.path().join("snapshot.json");
+    let inventory = dir.path().join("inventory.yml");
+    let out = dir.path().join("plan");
+    let shadow = dir.path().join("shadow");
+    fs::write(&snapshot, serde_json::to_vec(&sample("192.0.2.10/24"))?)?;
+    fs::write(&inventory, INVENTORY)?;
+    let mut plan = Command::new(env!("CARGO_BIN_EXE_netbox-sync"));
+    plan.arg("plan")
+        .env("NETBOX_SNAPSHOT_FILE", &snapshot)
+        .env("NETBOX_INVENTORY_FILE", &inventory)
+        .env("NETBOX_SITE", "test-site")
+        .env("NETBOX_PLAN_DIR", &out)
+        .env_remove("NETBOX_POLICY_FILE");
+    let result = plan.output()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("inventory.candidate.yml"))?,
+        INVENTORY
+    );
+    let result = plan
+        .env("NETBOX_SITE", "wrong-site")
+        .arg("--netbox-site")
+        .arg("test-site")
+        .arg("--out-dir")
+        .arg(&shadow)
+        .output()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read(out.join("plan.json"))?,
+        fs::read(shadow.join("plan.json"))?
+    );
+    Ok(())
+}
+
+#[test]
+fn snapshot_resolves_env_and_cli_before_reading_token_file() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_netbox-sync"))
+        .arg("snapshot")
+        .env("NETBOX_URL", "http://example.invalid")
+        .env("NETBOX_SITE", "test-site")
+        .env("NETBOX_TOKEN_FILE", dir.path().join("missing-token"))
+        .env("NETBOX_SNAPSHOT_FILE", dir.path().join("snapshot.json"))
+        .args(["--netbox-url", "https://example.invalid"])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("read token file"));
+    assert!(!dir.path().join("snapshot.json").exists());
+    Ok(())
+}
+
+#[test]
+fn run_cli_overrides_environment_and_failed_fetch_preserves_last_success() -> anyhow::Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let dir = tempfile::tempdir()?;
+    let state = dir.path().join("state");
+    let prom = dir.path().join("prom");
+    let vm = dir.path().join("vm");
+    for p in [&state, &prom, &vm] {
+        fs::create_dir(p)?;
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let status = state.join("status.json");
+    fs::write(
+        &status,
+        serde_json::to_vec(&json!({
+            "site": "test-site",
+            "last_attempt": now - 10,
+            "last_success": now - 10,
+            "generations": ["version-prom", "version-vm"],
+        }))?,
+    )?;
+    let out = Command::new(env!("CARGO_BIN_EXE_netbox-sync"))
+        .arg("run")
+        .env("NETBOX_URL", "https://example.invalid")
+        .env("NETBOX_SITE", "test-site")
+        .env("NETBOX_TOKEN_FILE", dir.path().join("missing-token"))
+        .env("NETBOX_INVENTORY_FILE", dir.path().join("inventory.yml"))
+        .env("NETBOX_POLICY_FILE", dir.path().join("policy.yml"))
+        .env("NETBOX_RENDER_FILE", dir.path().join("render.yml"))
+        .env("NETBOX_TEMPLATES_DIR", dir.path())
+        .env("NETBOX_OUTPUT_DIR", &state)
+        .env("NETBOX_PROMETHEUS_PUBLISH_DIR", &prom)
+        .env("NETBOX_VMAGENT_PUBLISH_DIR", &vm)
+        .env("NETBOX_SYNC_INTERVAL", "1m")
+        .env("NETBOX_PORT_MODE", "audit")
+        .env("NETBOX_RUN_ONCE", "true")
+        .args(["--netbox-url", "http://example.invalid"])
+        .output()?;
+    assert_eq!(out.status.code(), Some(2));
+    let saved: Value = serde_json::from_slice(&fs::read(&status)?)?;
+    assert!(
+        saved["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("must be HTTPS")
+    );
+    assert_eq!(saved["last_success"], now - 10);
+    assert_eq!(saved["generations"], json!(["version-prom", "version-vm"]));
+    assert!(!prom.join("current").exists() && !vm.join("current").exists());
+    let healthy = Command::new(env!("CARGO_BIN_EXE_netbox-sync"))
+        .arg("status")
+        .env("NETBOX_OUTPUT_DIR", &state)
+        .env("NETBOX_MAX_AGE", "1h")
+        .output()?;
+    assert!(healthy.status.success());
     Ok(())
 }
