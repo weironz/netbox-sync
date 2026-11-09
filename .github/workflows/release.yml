@@ -43,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}:$TAG"
-          docker build --platform linux/amd64 \
+          docker build --platform linux/amd64 --provenance=false \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.version=${TAG#v}" \
@@ -57,15 +57,23 @@ jobs:
           test "$(dist/netbox-sync --version)" = "netbox-sync ${TAG#v}"
           tar -czf "dist/netbox-sync-$TAG-linux-amd64.tar.gz" -C dist netbox-sync
           docker save "$image" | gzip -n > "dist/netbox-sync-image-$TAG-linux-amd64.tar.gz"
-      - name: Publish image and GitHub release
+      - name: Publish GitHub release assets
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:$TAG"
+          docker image inspect "$image" --format '{{.Id}}' > dist/image-id.txt
+          grep -Eq '^sha256:[a-f0-9]{64}$' dist/image-id.txt
+          (cd dist && sha256sum ./*.tar.gz image-id.txt > SHA256SUMS)
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "netbox-sync $TAG" \
+            --notes "Read-only NetBox snapshots and monitoring plans. Linux amd64 binary and Docker archive built from $GITHUB_SHA. Load the Docker archive with docker load -i; the local image tag is $image." \
+            dist/*.tar.gz dist/image-id.txt dist/SHA256SUMS
+      - name: Publish registry image if permitted
+        continue-on-error: true
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}:$TAG"
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          docker push "$image"
-          docker image inspect "$image" --format '{{index .RepoDigests 0}}' > dist/image-digest.txt
-          grep -Eq '@sha256:[a-f0-9]{64}$' dist/image-digest.txt
-          (cd dist && sha256sum ./*.tar.gz image-digest.txt > SHA256SUMS)
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "netbox-sync $TAG" \
-            --notes "Read-only NetBox snapshots and monitoring plans. Linux amd64 binary and Docker archive built from $GITHUB_SHA. Registry image: $image." \
-            dist/*.tar.gz dist/image-digest.txt dist/SHA256SUMS
+          if ! docker push "$image"; then
+            echo '::warning::GHCR did not accept the image. The Docker archive is available in the GitHub Release.'
+            exit 1
+          fi

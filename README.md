@@ -41,4 +41,4 @@ docker run --rm ghcr.io/weironz/netbox-sync:v0.1.0 --help
 
 ## 发布
 
-在 `main` 合并对应版本并更新 `Cargo.toml`、`Cargo.lock` 后，手动触发 `just release v0.1.0`。Workflow 校验版本和源码提交，执行格式、Clippy、测试和隔离镜像检查，再发布 GHCR 镜像及 GitHub Release。仓库只包含合成测试数据。
+在 `main` 合并对应版本并更新 `Cargo.toml`、`Cargo.lock` 后，手动触发 `just release v0.1.0`。Workflow 校验版本和源码提交，执行格式、Clippy、测试和隔离镜像检查，再发布 GitHub Release；最后尝试推送 GHCR，registry 拒绝不会阻断公开镜像归档下载。仓库只包含合成测试数据。
