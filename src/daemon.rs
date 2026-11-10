@@ -215,7 +215,14 @@ fn round(o: &RunOptions, s: &mut Status, fetch: impl FnOnce() -> Result<Snapshot
         candidate.as_deref() == Some(inventory.as_str()) && report.untracked_devices.is_empty(),
         "device drift needs review; see plan.json"
     );
-    let (prom, vm) = render::build(&inventory, &report, &spec, &o.templates_dir)?;
+    let (prom, vm) = render::build(
+        &inventory,
+        &report,
+        &snapshot,
+        &policy,
+        &spec,
+        &o.templates_dir,
+    )?;
     // Both renderers have passed equality validation before either pointer is updated.
     // In this mode, every release is byte-equivalent to its reviewed template.
     let prom_version =
