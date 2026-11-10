@@ -59,6 +59,10 @@ struct Status {
     files_verified: Option<usize>,
     generations: Option<[String; 2]>,
     last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_probe_success: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_targets: Option<usize>,
 }
 
 fn now() -> u64 {
@@ -200,6 +204,33 @@ fn round(o: &RunOptions, s: &mut Status, fetch: impl FnOnce() -> Result<Snapshot
         serde_yaml_ng::from_slice(&fs::read(&o.policy)?).context("parse policy")?;
     let spec: render::RenderSpec = serde_yaml_ng::from_slice(&fs::read(&o.render_file)?)
         .context("parse render specification")?;
+    if spec.live_probe.is_some() {
+        let path = o.prometheus_publish_dir.join("probe.yml");
+        let previous = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::read(o.templates_dir.join("prometheus").join("biz_targets.yml"))
+                    .context("read initial approved probe list")?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let (next, count) = render::live_probe(&inventory, &snapshot, &policy, &spec, &previous)?;
+        if next != previous || !path.is_file() {
+            let mut file = tempfile::NamedTempFile::new_in(&o.prometheus_publish_dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.as_file()
+                    .set_permissions(fs::Permissions::from_mode(0o644))?;
+            }
+            file.write_all(&next)?;
+            file.as_file().sync_all()?;
+            file.persist(path).map_err(|e| e.error)?;
+            sync_dir(&o.prometheus_publish_dir)?;
+        }
+        s.last_probe_success = Some(now());
+        s.probe_targets = Some(count);
+    }
     let (mut report, candidate) = plan::build(&inventory, &snapshot, Some(&o.site), Some(&policy))?;
     if matches!(o.port_mode, PortMode::Off) {
         report.links.clear();
