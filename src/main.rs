@@ -1,7 +1,9 @@
+mod daemon;
 mod model;
 mod netbox;
 mod plan;
 mod policy;
+mod render;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -21,30 +23,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Continuously validate and publish approved device targets.
+    Run(daemon::RunOptions),
+    /// Print persisted status and fail when no recent valid sync exists.
+    Status(daemon::StatusOptions),
     /// Read NetBox and save a minimal site snapshot. Does not modify NetBox.
     Snapshot {
-        #[arg(long)]
+        #[arg(long, env = "NETBOX_URL", hide_env_values = true)]
         netbox_url: String,
-        #[arg(long)]
+        #[arg(long, env = "NETBOX_SITE", hide_env_values = true)]
         site: String,
-        #[arg(long)]
+        #[arg(long, env = "NETBOX_TOKEN_FILE", hide_env_values = true)]
         token_file: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "NETBOX_SNAPSHOT_FILE", hide_env_values = true)]
         output: PathBuf,
     },
     /// Compare a snapshot with inventory.yml; output a report and, if equivalent, a candidate.
     Plan {
-        #[arg(long)]
+        #[arg(long, env = "NETBOX_SNAPSHOT_FILE", hide_env_values = true)]
         snapshot: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "NETBOX_INVENTORY_FILE", hide_env_values = true)]
         inventory: PathBuf,
-        #[arg(long)]
+        #[arg(long, env = "NETBOX_PLAN_DIR", hide_env_values = true)]
         out_dir: PathBuf,
         /// Explicit NetBox site slug if it differs from inventory.site.
-        #[arg(long)]
+        #[arg(long, env = "NETBOX_SITE", hide_env_values = true)]
         netbox_site: Option<String>,
         /// Optional site-specific alias and address-purpose policy.
-        #[arg(long)]
+        #[arg(long, env = "NETBOX_POLICY_FILE", hide_env_values = true)]
         policy: Option<PathBuf>,
     },
 }
@@ -64,6 +70,8 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 fn run(c: Cli) -> Result<u8> {
     match c.command {
+        Commands::Run(o) => daemon::run(o),
+        Commands::Status(o) => daemon::status(o),
         Commands::Snapshot {
             netbox_url,
             site,
