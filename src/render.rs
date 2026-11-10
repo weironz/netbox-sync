@@ -1,4 +1,8 @@
-use crate::plan::{Report, ResolvedDevice};
+use crate::{
+    model::{Snapshot, host_address},
+    plan::{Report, ResolvedDevice},
+    policy::Policy,
+};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -24,6 +28,8 @@ struct Job {
     file: String,
     address: Address,
     port: Option<u16>,
+    #[serde(default)]
+    fleet_by_role: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +37,7 @@ struct Job {
 enum Address {
     Business,
     Bmc,
+    PrimaryIpv4,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +99,7 @@ fn address<'a>(d: &'a ResolvedDevice, kind: &Address) -> Result<&'a str> {
     match kind {
         Address::Business => d.business_ip.as_deref(),
         Address::Bmc => d.bmc_ip.as_deref(),
+        Address::PrimaryIpv4 => None,
     }
     .with_context(|| format!("required address missing for {}", d.host))
 }
@@ -125,9 +133,92 @@ fn equivalent(name: &str, bytes: Vec<u8>, before: &Value, after: &Value) -> Resu
     Ok(bytes)
 }
 
+fn primary_ipv4_rows(
+    snapshot: &Snapshot,
+    aliases: &Policy,
+    roles: &Value,
+    labels: &serde_json::Map<String, Value>,
+    job: &Job,
+) -> Result<Vec<Value>> {
+    let mut ips = BTreeSet::new();
+    let mut hosts = BTreeSet::new();
+    let mut rows = Vec::new();
+    for d in snapshot.devices.iter().filter(|d| d.status == "active") {
+        let host = match aliases.aliases.iter().find(|(_, a)| a.device_id == d.id) {
+            Some((host, a)) => {
+                ensure!(
+                    a.netbox_name == d.name,
+                    "probe alias name changed for {host}"
+                );
+                host.as_str()
+            }
+            None => d.name.as_str(),
+        };
+        let ip = host_address(
+            d.primary_ip4
+                .as_deref()
+                .with_context(|| format!("Primary IPv4 missing for {host}"))?,
+        )?;
+        ensure!(
+            ip.is_ipv4() && ips.insert(ip),
+            "invalid or duplicate Primary IPv4: {ip}"
+        );
+        ensure!(
+            hosts.insert(host.to_lowercase()),
+            "duplicate probe host: {host}"
+        );
+        let group = string(&roles[&d.role], "group")
+            .with_context(|| format!("missing probe group for NetBox role {}", d.role))?;
+        let fields = [
+            ("host", host),
+            ("role", d.role.as_str()),
+            ("site", snapshot.site.slug.as_str()),
+            ("group", group),
+            (
+                "fleet",
+                job.fleet_by_role.get(&d.role).map_or(host, String::as_str),
+            ),
+        ];
+        rows.push(json!({"targets": [ip.to_string()], "labels": render_labels(labels, &fields)?}));
+    }
+    ensure!(!rows.is_empty(), "no active NetBox devices for biz-ping");
+    Ok(rows)
+}
+
+fn render_labels(
+    labels: &serde_json::Map<String, Value>,
+    fields: &[(&str, &str)],
+) -> Result<BTreeMap<String, String>> {
+    labels
+        .iter()
+        .map(|(k, v)| {
+            Ok((
+                k.clone(),
+                label_text(v.as_str().context("invalid label format")?, fields)?,
+            ))
+        })
+        .collect()
+}
+
+fn by_target(rows: &[Value]) -> Result<BTreeMap<&str, &Value>> {
+    let mut by_target = BTreeMap::new();
+    for row in rows {
+        let targets = seq(row, "targets")?;
+        ensure!(targets.len() == 1, "expected one probe address per row");
+        let ip = targets[0].as_str().context("invalid probe address")?;
+        ensure!(
+            by_target.insert(ip, row).is_none(),
+            "duplicate probe address: {ip}"
+        );
+    }
+    Ok(by_target)
+}
+
 pub(crate) fn build(
     inventory: &str,
     report: &Report,
+    snapshot: &Snapshot,
+    aliases: &Policy,
     spec: &RenderSpec,
     templates: &Path,
 ) -> Result<(Files, Files)> {
@@ -156,10 +247,33 @@ pub(crate) fn build(
     let mut prom = BTreeMap::new();
     let mut binding = BTreeMap::new();
     for (name, job) in &spec.jobs {
-        let mut rows = Vec::new();
         let policy = labels_by_job[name]
             .as_object()
             .context("invalid label policy")?;
+        if matches!(job.address, Address::PrimaryIpv4) {
+            ensure!(
+                name == "biz-ping" && job.port.is_none(),
+                "Primary IPv4 is supported for biz-ping only"
+            );
+            let (bytes, before) = template(&templates.join("prometheus"), &job.file)?;
+            let rows = primary_ipv4_rows(snapshot, aliases, &inventory["roles"], policy, job)?;
+            ensure!(
+                by_target(before.as_array().context("invalid approved probe list")?)?
+                    == by_target(&rows)?,
+                "generated {} differs from its approved template",
+                job.file
+            );
+            ensure!(
+                prom.insert(job.file.clone(), bytes).is_none(),
+                "duplicate target output"
+            );
+            continue;
+        }
+        ensure!(
+            job.fleet_by_role.is_empty(),
+            "fleet_by_role requires Primary IPv4"
+        );
+        let mut rows = Vec::new();
         for d in &active {
             let host = string(d, "host")?;
             let role = string(d, "role")?;
@@ -191,15 +305,7 @@ pub(crate) fn build(
             } else {
                 addr.to_owned()
             };
-            let labels = policy
-                .iter()
-                .map(|(k, v)| {
-                    Ok((
-                        k.clone(),
-                        label_text(v.as_str().context("invalid label format")?, &fields)?,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>>>()?;
+            let labels = render_labels(policy, &fields)?;
             ensure!(
                 binding
                     .insert((name.as_str(), addr.to_owned()), labels.clone())
