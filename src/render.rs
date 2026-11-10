@@ -20,6 +20,14 @@ pub(crate) struct RenderSpec {
     version: u32,
     jobs: BTreeMap<String, Job>,
     shared: Shared,
+    pub(crate) live_probe: Option<LiveProbe>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiveProbe {
+    pub(crate) minimum_targets: usize,
+    pub(crate) max_removed: usize,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +220,59 @@ fn by_target(rows: &[Value]) -> Result<BTreeMap<&str, &Value>> {
         );
     }
     Ok(by_target)
+}
+
+/// Generate the active probe set independently of hardware-collector approval.
+pub(crate) fn live_probe(
+    inventory: &str,
+    snapshot: &Snapshot,
+    policy: &Policy,
+    spec: &RenderSpec,
+    previous: &[u8],
+) -> Result<(Vec<u8>, usize)> {
+    let limits = spec
+        .live_probe
+        .as_ref()
+        .context("missing live probe limits")?;
+    ensure!(
+        spec.version == 1 && limits.minimum_targets > 0,
+        "invalid live probe policy"
+    );
+    let inventory: Value = serde_yaml_ng::from_str(inventory)?;
+    policy.validate(string(&inventory, "site")?, &snapshot.site.slug)?;
+    snapshot.validate()?;
+    let job = spec.jobs.get("biz-ping").context("missing biz-ping job")?;
+    ensure!(
+        matches!(job.address, Address::PrimaryIpv4) && job.port.is_none(),
+        "live probe requires biz-ping using Primary IPv4"
+    );
+    let labels = inventory["target_labels"]["biz-ping"]
+        .as_object()
+        .context("missing biz-ping labels")?;
+    let rows = primary_ipv4_rows(snapshot, policy, &inventory["roles"], labels, job)?;
+    ensure!(
+        rows.len() >= limits.minimum_targets,
+        "live probe has {} targets, below the minimum {}",
+        rows.len(),
+        limits.minimum_targets
+    );
+    let old: Vec<Value> =
+        serde_yaml_ng::from_slice(previous).context("parse last good probe list")?;
+    if by_target(&old)? == by_target(&rows)? {
+        return Ok((previous.to_vec(), rows.len()));
+    }
+    fn hosts(rows: &[Value]) -> Result<BTreeSet<&str>> {
+        rows.iter()
+            .map(|row| string(&row["labels"], "host"))
+            .collect()
+    }
+    let removed = hosts(&old)?.difference(&hosts(&rows)?).count();
+    ensure!(
+        removed <= limits.max_removed,
+        "live probe would remove {removed} hosts, above the limit {}",
+        limits.max_removed
+    );
+    Ok((serde_yaml_ng::to_string(&rows)?.into_bytes(), rows.len()))
 }
 
 pub(crate) fn build(
@@ -449,4 +510,55 @@ pub(crate) fn build(
         ),
     ]);
     Ok((prom, vm))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_probe_applies_primary_address_changes_and_limits_removals() {
+        let inventory = "
+site: demo
+roles:
+  gpu-server: {group: b300}
+target_labels:
+  biz-ping: {host: '{host}', group: '{group}'}
+";
+        let policy =
+            serde_yaml_ng::from_str("version: 1\ninventory_site: demo\nnetbox_site: demo").unwrap();
+        let spec = serde_yaml_ng::from_str(
+            "version: 1
+live_probe: {minimum_targets: 1, max_removed: 0}
+jobs:
+  biz-ping: {address: primary_ipv4, file: biz_targets.yml}
+shared: {protocols: {}, prometheus_jobs: {}}
+",
+        )
+        .unwrap();
+        let mut snapshot: Snapshot = serde_json::from_value(json!({
+            "schema_version": 1, "captured_at_unix": 1,
+            "site": {"id": 7, "slug": "demo"},
+            "devices": [
+                {"id": 1, "name": "node-a", "role": "gpu-server", "status": "active",
+                 "primary_ip4": "192.0.2.5/24", "oob_ip": "192.0.2.6/24"},
+                {"id": 2, "name": "node-b", "role": "gpu-server", "status": "active",
+                 "primary_ip4": "192.0.2.7/24"}
+            ], "interfaces": [], "ip_addresses": [], "cables": []
+        }))
+        .unwrap();
+        let previous = br#"[{"targets":["192.0.2.4"],"labels":{"host":"node-a","group":"b300"}}]"#;
+        let (rendered, count) = live_probe(inventory, &snapshot, &policy, &spec, previous).unwrap();
+        assert_eq!(count, 2);
+        let rows: Vec<Value> = serde_yaml_ng::from_slice(&rendered).unwrap();
+        let targets = by_target(&rows).unwrap();
+        assert_eq!(
+            targets.keys().copied().collect::<Vec<_>>(),
+            ["192.0.2.5", "192.0.2.7"]
+        );
+        let (unchanged, _) = live_probe(inventory, &snapshot, &policy, &spec, &rendered).unwrap();
+        assert_eq!(unchanged, rendered);
+        snapshot.devices[1].status = "staged".into();
+        let error = live_probe(inventory, &snapshot, &policy, &spec, &rendered).unwrap_err();
+        assert!(error.to_string().contains("would remove 1 hosts"));
+    }
 }
