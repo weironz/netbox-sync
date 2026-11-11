@@ -143,6 +143,19 @@ fn equivalent(name: &str, bytes: Vec<u8>, before: &Value, after: &Value) -> Resu
     Ok(bytes)
 }
 
+fn equivalent_targets(
+    name: &str,
+    bytes: Vec<u8>,
+    before: &Value,
+    rows: &[Value],
+) -> Result<Vec<u8>> {
+    ensure!(
+        by_target(before.as_array().context("invalid approved target list")?)? == by_target(rows)?,
+        "generated {name} differs from its approved template"
+    );
+    Ok(bytes)
+}
+
 fn primary_ipv4_rows(
     snapshot: &Snapshot,
     aliases: &Policy,
@@ -331,13 +344,11 @@ pub(crate) fn build(
             let (bytes, before) = template(&templates.join("prometheus"), &job.file)?;
             let rows = primary_ipv4_rows(snapshot, aliases, &inventory["roles"], policy, job)?;
             ensure!(
-                by_target(before.as_array().context("invalid approved probe list")?)?
-                    == by_target(&rows)?,
-                "generated {} differs from its approved template",
-                job.file
-            );
-            ensure!(
-                prom.insert(job.file.clone(), bytes).is_none(),
+                prom.insert(
+                    job.file.clone(),
+                    equivalent_targets(&job.file, bytes, &before, &rows)?
+                )
+                .is_none(),
                 "duplicate target output"
             );
             continue;
@@ -391,7 +402,7 @@ pub(crate) fn build(
         ensure!(
             prom.insert(
                 job.file.clone(),
-                equivalent(&job.file, bytes, &before, &json!(rows))?
+                equivalent_targets(&job.file, bytes, &before, &rows)?
             )
             .is_none(),
             "duplicate target output"
