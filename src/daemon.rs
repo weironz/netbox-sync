@@ -6,6 +6,7 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
+    process::Command,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -24,8 +25,18 @@ pub(crate) struct RunOptions {
     site: String,
     #[arg(long, env = "NETBOX_TOKEN_FILE", hide_env_values = true)]
     token_file: PathBuf,
-    #[arg(long, env = "NETBOX_INVENTORY_FILE", hide_env_values = true)]
-    inventory: PathBuf,
+    #[arg(
+        long,
+        env = "NETBOX_INVENTORY_FILE",
+        hide_env_values = true,
+        required_unless_present = "inventory_generator",
+        conflicts_with = "inventory_generator"
+    )]
+    inventory: Option<PathBuf>,
+    /// Executable receiving the snapshot JSON path and returning inventory YAML on stdout.
+    /// With --probe-only it returns the site, roles and target labels without resolving cables.
+    #[arg(long, env = "NETBOX_INVENTORY_GENERATOR", hide_env_values = true)]
+    inventory_generator: Option<PathBuf>,
     #[arg(long, env = "NETBOX_POLICY_FILE", hide_env_values = true)]
     policy: PathBuf,
     #[arg(long, env = "NETBOX_RENDER_FILE", hide_env_values = true)]
@@ -197,14 +208,52 @@ fn publish(_: &Path, _: &render::Files) -> Result<String> {
     anyhow::bail!("managed file publication requires Linux")
 }
 
+fn generate_inventory(o: &RunOptions, snapshot: &Snapshot, probe_only: bool) -> Result<String> {
+    let program = o
+        .inventory_generator
+        .as_ref()
+        .context("missing inventory generator")?;
+    ensure!(
+        program.is_absolute(),
+        "inventory generator must use an absolute executable path"
+    );
+    let mut input = tempfile::NamedTempFile::new_in(&o.output_dir)?;
+    serde_json::to_writer(&mut input, snapshot)?;
+    let mut command = Command::new(program);
+    command.arg(input.path());
+    if probe_only {
+        command.arg("--probe-only");
+    }
+    let output = command.output().context("run inventory generator")?;
+    ensure!(
+        output.status.success(),
+        "inventory generator failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8(output.stdout).context("inventory generator output is not UTF-8")
+}
+
 fn round(o: &RunOptions, s: &mut Status, fetch: impl FnOnce() -> Result<Snapshot>) -> Result<()> {
     let snapshot = fetch().context("fetch NetBox snapshot")?;
-    let inventory = fs::read_to_string(&o.inventory).context("read approved inventory")?;
+    let legacy = o
+        .inventory
+        .as_ref()
+        .map(fs::read_to_string)
+        .transpose()
+        .context("read approved inventory")?;
     let policy: Policy =
         serde_yaml_ng::from_slice(&fs::read(&o.policy)?).context("parse policy")?;
     let spec: render::RenderSpec = serde_yaml_ng::from_slice(&fs::read(&o.render_file)?)
         .context("parse render specification")?;
     if spec.live_probe.is_some() {
+        let probe;
+        let inventory = match legacy.as_deref() {
+            Some(text) => text,
+            None => {
+                probe = generate_inventory(o, &snapshot, true)?;
+                &probe
+            }
+        };
         let path = o.prometheus_publish_dir.join("probe.yml");
         let previous = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -214,7 +263,7 @@ fn round(o: &RunOptions, s: &mut Status, fetch: impl FnOnce() -> Result<Snapshot
             }
             Err(e) => return Err(e.into()),
         };
-        let (next, count) = render::live_probe(&inventory, &snapshot, &policy, &spec, &previous)?;
+        let (next, count) = render::live_probe(inventory, &snapshot, &policy, &spec, &previous)?;
         if next != previous || !path.is_file() {
             let mut file = tempfile::NamedTempFile::new_in(&o.prometheus_publish_dir)?;
             #[cfg(unix)]
@@ -231,6 +280,10 @@ fn round(o: &RunOptions, s: &mut Status, fetch: impl FnOnce() -> Result<Snapshot
         s.last_probe_success = Some(now());
         s.probe_targets = Some(count);
     }
+    let inventory = match legacy {
+        Some(text) => text,
+        None => generate_inventory(o, &snapshot, false)?,
+    };
     let (mut report, candidate) = plan::build(&inventory, &snapshot, Some(&o.site), Some(&policy))?;
     if matches!(o.port_mode, PortMode::Off) {
         report.links.clear();
