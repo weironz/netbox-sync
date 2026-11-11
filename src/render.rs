@@ -38,6 +38,8 @@ struct Job {
     port: Option<u16>,
     #[serde(default)]
     fleet_by_role: BTreeMap<String, String>,
+    #[serde(default)]
+    exclude_roles: BTreeSet<String>,
 }
 
 #[derive(Deserialize)]
@@ -148,10 +150,20 @@ fn primary_ipv4_rows(
     labels: &serde_json::Map<String, Value>,
     job: &Job,
 ) -> Result<Vec<Value>> {
+    for role in &job.exclude_roles {
+        ensure!(
+            !role.is_empty() && role.trim() == role && roles.get(role).is_none(),
+            "cannot exclude an invalid or managed probe role: {role}"
+        );
+    }
     let mut ips = BTreeSet::new();
     let mut hosts = BTreeSet::new();
     let mut rows = Vec::new();
-    for d in snapshot.devices.iter().filter(|d| d.status == "active") {
+    for d in snapshot
+        .devices
+        .iter()
+        .filter(|d| d.status == "active" && !job.exclude_roles.contains(&d.role))
+    {
         let host = match aliases.aliases.iter().find(|(_, a)| a.device_id == d.id) {
             Some((host, a)) => {
                 ensure!(
@@ -331,8 +343,8 @@ pub(crate) fn build(
             continue;
         }
         ensure!(
-            job.fleet_by_role.is_empty(),
-            "fleet_by_role requires Primary IPv4"
+            job.fleet_by_role.is_empty() && job.exclude_roles.is_empty(),
+            "fleet_by_role and exclude_roles require Primary IPv4"
         );
         let mut rows = Vec::new();
         for d in &active {
@@ -526,11 +538,11 @@ target_labels:
 ";
         let policy =
             serde_yaml_ng::from_str("version: 1\ninventory_site: demo\nnetbox_site: demo").unwrap();
-        let spec = serde_yaml_ng::from_str(
+        let mut spec: RenderSpec = serde_yaml_ng::from_str(
             "version: 1
 live_probe: {minimum_targets: 1, max_removed: 0}
 jobs:
-  biz-ping: {address: primary_ipv4, file: biz_targets.yml}
+  biz-ping: {address: primary_ipv4, file: biz_targets.yml, exclude_roles: [provider-handoff]}
 shared: {protocols: {}, prometheus_jobs: {}}
 ",
         )
@@ -542,7 +554,8 @@ shared: {protocols: {}, prometheus_jobs: {}}
                 {"id": 1, "name": "node-a", "role": "gpu-server", "status": "active",
                  "primary_ip4": "192.0.2.5/24", "oob_ip": "192.0.2.6/24"},
                 {"id": 2, "name": "node-b", "role": "gpu-server", "status": "active",
-                 "primary_ip4": "192.0.2.7/24"}
+                 "primary_ip4": "192.0.2.7/24"},
+                {"id": 3, "name": "provider-switch", "role": "provider-handoff", "status": "active"}
             ], "interfaces": [], "ip_addresses": [], "cables": []
         }))
         .unwrap();
@@ -560,5 +573,9 @@ shared: {protocols: {}, prometheus_jobs: {}}
         snapshot.devices[1].status = "staged".into();
         let error = live_probe(inventory, &snapshot, &policy, &spec, &rendered).unwrap_err();
         assert!(error.to_string().contains("would remove 1 hosts"));
+        let excluded = &mut spec.jobs.get_mut("biz-ping").unwrap().exclude_roles;
+        excluded.insert("gpu-server".into());
+        let error = live_probe(inventory, &snapshot, &policy, &spec, &rendered).unwrap_err();
+        assert!(error.to_string().contains("managed probe role"));
     }
 }
