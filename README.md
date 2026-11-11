@@ -57,7 +57,7 @@ Linux 上使用 `netbox-sync run`；启动后立即运行一次，然后按周�
 
 `netbox-sync status --output-dir <dir> --max-age 3h` 可用于健康检查。它根据最后一次成功时间返回状态码；`--max-age` 也支持 `NETBOX_MAX_AGE`。两个发布目录各有一个原子更新的 `current` 相对符号链接。采集器只读挂载生成目录，不持有 NetBox Token，也不依赖同步进程在线。
 
-对于 `biz-ping`，可在渲染配置中选用 `address: primary_ipv4`。目标直接取快照内该站点的所有 Active 设备及其 Primary IPv4。设备角色用于输出分组标签，可选的 `fleet_by_role` 用于保留部署已有的 fleet 标签。别名按配置中的 ID 和名称核对。缺失或重复地址以及与审批模板不一致都会阻止发布。已有业务地址标签和 OOB 解析规则仍适用于其他任务。
+对于 `biz-ping`，可在渲染配置中选用 `address: primary_ipv4`。默认取快照内该站点的所有 Active 设备及其 Primary IPv4。可选的 `exclude_roles` 按 NetBox 角色 slug 排除站点库存之外的设备，例如第三方交接交换机。已排除的设备仍可参与线缆对账，站点库存定义的监控角色不可排除。设备角色用于输出分组标签，可选的 `fleet_by_role` 用于保留部署已有的 fleet 标签。别名按配置中的 ID 和名称核对。缺失或重复地址以及与审批模板不一致都会阻止发布。已有业务地址标签和 OOB 解析规则仍适用于其他任务。
 
 ## Linux 和 Docker
 
