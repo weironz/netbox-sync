@@ -11,12 +11,22 @@ pub(crate) struct Alias {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct InterfaceAlias {
+    pub device_id: u64,
+    pub interface_id: u64,
+    pub netbox_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Policy {
     pub version: u32,
     pub inventory_site: String,
     pub netbox_site: String,
     #[serde(default)]
     pub aliases: BTreeMap<String, Alias>,
+    #[serde(default)]
+    pub interface_aliases: BTreeMap<String, InterfaceAlias>,
     #[serde(default)]
     pub business_ip_tag_by_role: BTreeMap<String, String>,
     #[serde(default)]
@@ -40,6 +50,24 @@ impl Policy {
                     && ids.insert(a.device_id)
                     && !a.netbox_name.is_empty(),
                 "invalid or duplicate alias mapping"
+            );
+        }
+        let mut endpoints = BTreeSet::new();
+        let mut interfaces = BTreeSet::new();
+        for (endpoint, alias) in &self.interface_aliases {
+            ensure!(
+                endpoint.split_once('/').is_some_and(|(host, port)| {
+                    !host.is_empty()
+                        && host.trim() == host
+                        && !port.is_empty()
+                        && port.trim() == port
+                }) && endpoints.insert(endpoint.to_lowercase())
+                    && alias.device_id > 0
+                    && alias.interface_id > 0
+                    && interfaces.insert(alias.interface_id)
+                    && !alias.netbox_name.is_empty()
+                    && alias.netbox_name.trim() == alias.netbox_name,
+                "invalid or duplicate interface alias {endpoint}"
             );
         }
         ensure!(
