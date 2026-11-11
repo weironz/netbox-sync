@@ -87,9 +87,13 @@ inventory_site: example-site
 netbox_site: registered-site
 aliases:
   old-monitoring-label: {device_id: 22, netbox_name: registered-host}
+interface_aliases:
+  old-monitoring-label/HCA-01: {device_id: 22, interface_id: 102, netbox_name: mlx5_0p1}
 business_ip_tag_by_role:
   server: monitoring-biz
 require_oob_roles: [server]
 ```
 
 别名要同时匹配站点、NetBox ID 和预期名称，输出继续用原监控标签。配置业务标签的角色必须有且仅有一个绑定在启用接口上的 active IPv4；缺失或歧义会拦截候选。要求 OOB 的角色必须有一个与设备 OOB 地址相符的 active IPv4 绑定。`plan.json` 的 `resolved_devices` 记录选出的地址，供与现网逐项核对；工具不把新字段自动加到已有清单，也不会应用候选。`snapshot` 保存 NetBox IP 的状态及标签。
+
+`interface_aliases` 用于同一设备上的端口命名差异。键是库存中的 `设备/接口`，值固定到 NetBox 设备 ID、接口 ID 和接口名。匹配要求目标接口启用，且该映射与其他清单端口或已存在的同名接口无冲突。身份校验失败时，链路报告为 `invalid_interface_alias`。对账仍检查两端的实际线缆；端口别名不改写库存、采集配置或端口规则。

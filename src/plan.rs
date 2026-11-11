@@ -88,6 +88,7 @@ fn link_report(
     doc: &Value,
     snapshot: &Snapshot,
     aliases: &BTreeMap<u64, String>,
+    policy: Option<&Policy>,
 ) -> Result<Vec<LinkReport>> {
     let Some(baseline) = doc.get("port_baseline") else {
         return Ok(Vec::new());
@@ -111,7 +112,33 @@ fn link_report(
             )
         })
         .collect();
-    let known: BTreeSet<_> = endpoints.values().collect();
+    let known: BTreeSet<_> = endpoints.values().map(String::as_str).collect();
+    let mut interface_aliases = BTreeMap::new();
+    if let Some(policy) = policy.filter(|p| !p.interface_aliases.is_empty()) {
+        let mut planned = BTreeSet::new();
+        for link in links {
+            planned.insert(field(link, "a")?.to_lowercase());
+            planned.insert(field(link, "b")?.to_lowercase());
+        }
+        let interfaces: BTreeMap<_, _> = snapshot.interfaces.iter().map(|i| (i.id, i)).collect();
+        for (label, alias) in &policy.interface_aliases {
+            let key = label.to_lowercase();
+            let owner = key.split_once('/').map(|(host, _)| host);
+            let resolved = interfaces
+                .get(&alias.interface_id)
+                .filter(|i| {
+                    i.device_id == alias.device_id
+                        && i.name == alias.netbox_name
+                        && i.enabled
+                        && owner == Some(names[&i.device_id].to_lowercase().as_str())
+                })
+                .map(|i| endpoints[&i.id].as_str())
+                .filter(|target| {
+                    *target == key || (!known.contains(key.as_str()) && !planned.contains(*target))
+                });
+            interface_aliases.insert(key, resolved);
+        }
+    }
     let mut pairs: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
     let mut peers: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut details: BTreeMap<&str, Vec<LinkPeer>> = BTreeMap::new();
@@ -152,25 +179,32 @@ fn link_report(
             let b = field(l, "b")?;
             let an = a.to_lowercase();
             let bn = b.to_lowercase();
-            let (ak, bk) = if an <= bn {
-                (an.as_str(), bn.as_str())
-            } else {
-                (bn.as_str(), an.as_str())
-            };
-            let statuses = pairs.get(&(ak, bk));
+            let ar = interface_aliases
+                .get(&an)
+                .copied()
+                .unwrap_or(Some(an.as_str()));
+            let br = interface_aliases
+                .get(&bn)
+                .copied()
+                .unwrap_or(Some(bn.as_str()));
+            let pair = ar
+                .zip(br)
+                .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
             let another =
                 |x: &str, y: &str| peers.get(x).is_some_and(|p| p.iter().any(|q| *q != y));
-            let state = match statuses.map(Vec::as_slice) {
-                Some(["active" | "connected"]) if !another(ak, bk) && !another(bk, ak) => {
-                    "exact_active"
+            let state = pair.map_or("invalid_interface_alias", |(ak, bk)| {
+                match pairs.get(&(ak, bk)).map(Vec::as_slice) {
+                    Some(["active" | "connected"]) if !another(ak, bk) && !another(bk, ak) => {
+                        "exact_active"
+                    }
+                    Some(["active" | "connected"]) => "ambiguous_cable",
+                    Some([_]) => "exact_nonactive",
+                    Some(_) => "ambiguous_cable",
+                    None if another(ak, bk) || another(bk, ak) => "different_active_peer",
+                    None if !known.contains(ak) || !known.contains(bk) => "interface_missing",
+                    None => "no_direct_cable",
                 }
-                Some(["active" | "connected"]) => "ambiguous_cable",
-                Some([_]) => "exact_nonactive",
-                Some(_) => "ambiguous_cable",
-                None if another(ak, bk) || another(bk, ak) => "different_active_peer",
-                None if !known.contains(&an) || !known.contains(&bn) => "interface_missing",
-                None => "no_direct_cable",
-            };
+            });
             Ok(LinkReport {
                 a: a.to_owned(),
                 b: b.to_owned(),
@@ -180,13 +214,23 @@ fn link_report(
                     .unwrap_or("unspecified")
                     .to_owned(),
                 state,
-                a_observed_peers: details.get(an.as_str()).cloned().unwrap_or_default(),
-                b_observed_peers: details.get(bn.as_str()).cloned().unwrap_or_default(),
-                missing_endpoints: [(a, &an), (b, &bn)]
+                a_observed_peers: ar
+                    .and_then(|key| details.get(key))
+                    .cloned()
+                    .unwrap_or_default(),
+                b_observed_peers: br
+                    .and_then(|key| details.get(key))
+                    .cloned()
+                    .unwrap_or_default(),
+                missing_endpoints: [(a, ar), (b, br)]
                     .into_iter()
-                    .filter_map(|(label, key)| (!known.contains(key)).then_some(label.to_owned()))
+                    .filter(|(_, key)| key.is_none_or(|key| !known.contains(key)))
+                    .map(|(label, _)| label.to_owned())
                     .collect(),
-                exact_cable_ids: exact_ids.get(&(ak, bk)).cloned().unwrap_or_default(),
+                exact_cable_ids: pair
+                    .and_then(|key| exact_ids.get(&key))
+                    .cloned()
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -307,7 +351,7 @@ pub(crate) fn build(
         "duplicate inventory device names"
     );
     let (aliases, alias_names) = resolve_aliases(policy, snapshot, &inventory_names, &known)?;
-    let links = link_report(&doc, snapshot, &alias_names)?;
+    let links = link_report(&doc, snapshot, &alias_names, policy)?;
     let mut link_summary = BTreeMap::new();
     for l in &links {
         *link_summary.entry(l.state).or_insert(0) += 1;

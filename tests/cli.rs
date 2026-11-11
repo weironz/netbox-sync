@@ -67,6 +67,85 @@ fn equivalent_devices_create_a_candidate_without_removing_a_missing_link() -> an
     Ok(())
 }
 
+fn interface_alias_report(
+    peer_id: u64,
+    pinned_device: u64,
+    pinned_name: &str,
+) -> anyhow::Result<Value> {
+    let dir = tempfile::tempdir()?;
+    let inv = dir.path().join("inventory.yml");
+    let snapshot = dir.path().join("snapshot.json");
+    let policy = dir.path().join("policy.yml");
+    let out = dir.path().join("out");
+    let mut s = sample("192.0.2.10/24");
+    s["interfaces"] = json!([
+        {"id": 101, "device_id": 11, "name": "sw1p1", "enabled": true},
+        {"id": 102, "device_id": 22, "name": "mlx5_0p1", "enabled": true},
+        {"id": 103, "device_id": 22, "name": "mlx5_0p2", "enabled": true}
+    ]);
+    s["cables"] = json!([{
+        "id": 301, "status": "connected",
+        "a": [{"kind": "dcim.interface", "id": 101}],
+        "b": [{"kind": "dcim.interface", "id": peer_id}]
+    }]);
+    fs::write(&inv, INVENTORY)?;
+    fs::write(&snapshot, serde_json::to_vec(&s)?)?;
+    fs::write(
+        &policy,
+        format!(
+            "version: 1\ninventory_site: test-site\nnetbox_site: test-site\ninterface_aliases:\n  host-01/HCA-01: {{device_id: {pinned_device}, interface_id: 102, netbox_name: {pinned_name}}}\n"
+        ),
+    )?;
+    let result = Command::new(env!("CARGO_BIN_EXE_netbox-sync"))
+        .arg("plan")
+        .arg("--snapshot")
+        .arg(snapshot)
+        .arg("--inventory")
+        .arg(inv)
+        .arg("--policy")
+        .arg(policy)
+        .arg("--out-dir")
+        .arg(&out)
+        .output()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("inventory.candidate.yml"))?,
+        INVENTORY
+    );
+    Ok(serde_json::from_slice(&fs::read(out.join("plan.json"))?)?)
+}
+
+#[test]
+fn verified_interface_alias_matches_without_rewriting_inventory() -> anyhow::Result<()> {
+    let d = interface_alias_report(102, 22, "mlx5_0p1")?;
+    assert_eq!(d["links"][0]["state"], "exact_active");
+    assert_eq!(d["links"][0]["exact_cable_ids"], json!([301]));
+    assert_eq!(d["links"][0]["b"], "host-01/HCA-01");
+    Ok(())
+}
+
+#[test]
+fn interface_alias_does_not_hide_a_different_port() -> anyhow::Result<()> {
+    let d = interface_alias_report(103, 22, "mlx5_0p1")?;
+    assert_eq!(d["links"][0]["state"], "different_active_peer");
+    assert_eq!(d["links"][0]["exact_cable_ids"], json!([]));
+    Ok(())
+}
+
+#[test]
+fn interface_alias_requires_both_the_pinned_owner_and_name() -> anyhow::Result<()> {
+    for (owner, name) in [(11, "mlx5_0p1"), (22, "stale-name")] {
+        let d = interface_alias_report(102, owner, name)?;
+        assert_eq!(d["links"][0]["state"], "invalid_interface_alias");
+        assert_eq!(d["links"][0]["exact_cable_ids"], json!([]));
+    }
+    Ok(())
+}
+
 #[test]
 fn a_different_primary_address_only_creates_the_diff() -> anyhow::Result<()> {
     let (dir, out) = run_plan("192.0.2.99/24", None)?;
