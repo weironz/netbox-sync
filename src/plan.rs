@@ -23,12 +23,12 @@ pub(crate) struct LinkReport {
     a_observed_peers: Vec<LinkPeer>,
     b_observed_peers: Vec<LinkPeer>,
     missing_endpoints: Vec<String>,
-    exact_cable_ids: Vec<u64>,
+    exact_cable_ids: Vec<i64>,
 }
 #[derive(Clone, Serialize)]
 struct LinkPeer {
     endpoint: String,
-    cable_id: u64,
+    cable_id: i64,
 }
 
 #[derive(Serialize)]
@@ -142,7 +142,7 @@ fn link_report(
     let mut pairs: BTreeMap<(&str, &str), Vec<&str>> = BTreeMap::new();
     let mut peers: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut details: BTreeMap<&str, Vec<LinkPeer>> = BTreeMap::new();
-    let mut exact_ids: BTreeMap<(&str, &str), Vec<u64>> = BTreeMap::new();
+    let mut exact_ids: BTreeMap<(&str, &str), Vec<i64>> = BTreeMap::new();
     for c in &snapshot.cables {
         let ([a], [b]) = (c.a.as_slice(), c.b.as_slice()) else {
             continue;

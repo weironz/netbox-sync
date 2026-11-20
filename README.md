@@ -103,3 +103,10 @@ require_oob_roles: [server]
 Set `NETBOX_APPROVALS_FILE` to a site approvals file to generate the monitored inventory inside the Rust process. Existing inventory-file integrations remain supported. To enable rule publication, also set `NETBOX_BASELINE_INPUTS_DIR`, `NETBOX_BASELINE_OUTPUT_DIR`, and `PROMETHEUS_URL`. The official Linux image contains `/bin/promtool` for validating the four generated rule files before replacing `current` and requesting a Prometheus reload. A previous approved generation must already exist in the output directory. The native status check covers both target synchronization and baseline publication when the baseline directory is configured.
 
 Use `netbox-sync inventory --help` and `netbox-sync baseline-preview --help` to review the inventory and rules from a saved snapshot and asset metadata before deployment.
+
+
+### Approved site migration
+
+Use `netbox-sync run-approved --dry-run` to compare an installed site's approved inventory, active vmagent targets, and generated Prometheus configuration with NetBox. The site directory holds `inventory.yml`, `inband-features.yml`, `netbox-sync/approvals.yml`, and the installed `prometheus/` configuration. Connector positions and HCA GUIDs are verified before accepting split-cable links.
+
+With `NETBOX_BASELINE_OUTPUT_DIR`, `PROMETHEUS_URL`, `VMAGENT_URL`, and `NETBOX_REDFISH_TARGETS_FILE` set, `run-approved` publishes only equivalent target and rule generations. Seed `current` with the last approved version before enabling publication. `approved-status` reads the outcome and freshness from `NETBOX_OUTPUT_DIR`. Use `--snapshot` with `--metadata` for an offline dry-run and `--preview-out` to inspect candidate files.

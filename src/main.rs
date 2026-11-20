@@ -1,4 +1,5 @@
 mod approvals;
+mod approved_site;
 mod baseline;
 mod baseline_inventory;
 mod baseline_ports;
@@ -30,6 +31,10 @@ struct Cli {
 enum Commands {
     /// Continuously validate and publish approved device targets.
     Run(Box<daemon::RunOptions>),
+    /// Reconcile approved site assets, split cables and established collector targets.
+    RunApproved(Box<approved_site::Options>),
+    /// Check the approved-site publisher health.
+    ApprovedStatus(approved_site::Health),
     /// Print persisted status and fail when no recent valid sync exists.
     Status(daemon::StatusOptions),
     /// Read NetBox and save a minimal site snapshot. Does not modify NetBox.
@@ -104,6 +109,8 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 fn run(c: Cli) -> Result<u8> {
     match c.command {
         Commands::Run(o) => daemon::run(*o),
+        Commands::RunApproved(o) => approved_site::run(*o),
+        Commands::ApprovedStatus(o) => approved_site::health(o),
         Commands::Status(o) => daemon::status(o),
         Commands::Snapshot {
             netbox_url,

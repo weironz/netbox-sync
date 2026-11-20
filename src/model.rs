@@ -37,14 +37,14 @@ pub(crate) struct Address {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Termination {
     pub kind: String,
     pub id: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Cable {
-    pub id: u64,
+    pub id: i64,
     pub status: String,
     pub a: Vec<Termination>,
     pub b: Vec<Termination>,
@@ -130,7 +130,7 @@ impl Snapshot {
         let mut cables = BTreeSet::new();
         for c in &self.cables {
             ensure!(
-                c.id > 0 && cables.insert(c.id) && !c.status.is_empty(),
+                c.id != 0 && cables.insert(c.id) && !c.status.is_empty(),
                 "duplicate or invalid cable"
             );
             ensure!(

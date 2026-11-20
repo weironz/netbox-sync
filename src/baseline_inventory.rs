@@ -13,27 +13,27 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Settings {
-    exclude_roles: BTreeSet<String>,
-    minimum_devices: usize,
-    gpu_profiles: BTreeMap<String, Mapping>,
-    cable_tag: String,
+    pub(crate) exclude_roles: BTreeSet<String>,
+    pub(crate) minimum_devices: usize,
+    pub(crate) gpu_profiles: BTreeMap<String, Mapping>,
+    pub(crate) cable_tag: String,
     #[serde(default)]
-    require_cable_tag: bool,
+    pub(crate) require_cable_tag: bool,
     #[serde(default)]
-    retain_confirmed: bool,
+    pub(crate) retain_confirmed: bool,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct Metadata {
     pub(crate) assets: BTreeMap<u64, Json>,
     pub(crate) gpu_types: BTreeMap<u64, Json>,
-    pub(crate) tags: BTreeMap<u64, Json>,
+    pub(crate) tags: BTreeMap<i64, Json>,
 }
 
 #[derive(Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Membership {
-    pub(crate) cable_ids: BTreeSet<u64>,
+    pub(crate) cable_ids: BTreeSet<i64>,
     pub(crate) device_ids: BTreeSet<u64>,
 }
 
@@ -74,7 +74,26 @@ pub(crate) fn reconcile(
         settings.exclude_roles == approvals.exclude_roles,
         "baseline and inventory role exclusions differ"
     );
-    let mut config = approvals.project(snapshot, policy, false)?;
+    reconcile_projected(
+        approvals.project(snapshot, policy, false)?,
+        snapshot,
+        policy,
+        settings,
+        metadata,
+        previous,
+        approvals.retained_links(),
+    )
+}
+
+pub(crate) fn reconcile_projected<'a>(
+    mut config: Mapping,
+    snapshot: &Snapshot,
+    policy: &Policy,
+    settings: &Settings,
+    metadata: &Metadata,
+    previous: Option<&Membership>,
+    retained_links: impl IntoIterator<Item = &'a Mapping>,
+) -> Result<Baseline> {
     let endpoints = approvals::endpoints(snapshot, policy)?;
     let inventory = config
         .get("devices")
@@ -117,6 +136,10 @@ pub(crate) fn reconcile(
             .get(&host_key)
             .context("missing projected device")?)
         .clone();
+        ensure!(
+            text_field(&row, "role")? == d.role,
+            "device role changed: {host}"
+        );
         if let Some(ip) = &d.oob_ip {
             put(&mut row, "bmc", host_address(ip)?.to_string());
         }
@@ -181,7 +204,7 @@ pub(crate) fn reconcile(
         "cable list changed since snapshot"
     );
     let mut by_pair: BTreeMap<[u64; 2], Vec<_>> = BTreeMap::new();
-    let mut occupied: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    let mut occupied: BTreeMap<u64, BTreeSet<i64>> = BTreeMap::new();
     for (id, cable) in &cables {
         ensure!(
             metadata.tags[id]["status"]["value"].as_str() == Some(&cable.status),
@@ -209,7 +232,7 @@ pub(crate) fn reconcile(
             .and_then(|id| endpoints.ids.get(&(*id, port.to_lowercase())))
             .copied())
     };
-    let connected = |port: u64, id: u64| {
+    let connected = |port: u64, id: i64| {
         occupied
             .get(&port)
             .is_some_and(|owners| owners.len() == 1 && owners.contains(&id))
@@ -219,7 +242,7 @@ pub(crate) fn reconcile(
     let mut used = BTreeSet::new();
     let mut retained = Vec::new();
     let mut exceptions = BTreeSet::new();
-    for item in approvals.retained_links() {
+    for item in retained_links {
         ensure!(
             exceptions.insert(link_key(text_field(item, "a")?, text_field(item, "b")?)),
             "duplicate retained link"
