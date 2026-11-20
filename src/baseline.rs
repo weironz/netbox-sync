@@ -174,8 +174,8 @@ pub(crate) fn publish(
         );
         Ok(())
     };
-    stage.keep();
     pointer(root, Path::new(&name))?;
+    let _ = stage.keep();
     if let Err(err) = crate::daemon::sync_dir(root).and_then(|()| reload()) {
         pointer(root, &previous).context("restore last approved rule generation")?;
         crate::daemon::sync_dir(root).context("persist restored rule generation")?;
