@@ -140,12 +140,31 @@ impl NetBox {
         Ok(Self { base, client, auth })
     }
     fn get<T: serde::de::DeserializeOwned>(&self, url: Url) -> Result<T> {
-        let response = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, self.auth.clone())
-            .send()?;
-        ensure!(response.status().is_success(), "HTTP {}", response.status());
+        let mut retries = 0;
+        let response = loop {
+            let result = self
+                .client
+                .get(url.clone())
+                .header(AUTHORIZATION, self.auth.clone())
+                .send();
+            let transient = match &result {
+                Err(e) => e.is_timeout() || e.is_connect(),
+                Ok(r) => {
+                    let status = r.status();
+                    status.is_server_error()
+                        || status.as_u16() == 429
+                        || (status.as_u16() == 404 && !r.headers().contains_key("api-version"))
+                }
+            };
+            if transient && retries < 2 {
+                retries += 1;
+                std::thread::sleep(Duration::from_secs(retries));
+                continue;
+            }
+            let response = result?;
+            ensure!(response.status().is_success(), "HTTP {}", response.status());
+            break response;
+        };
         let mut bytes = Vec::new();
         response.take(MAX_PAGE_BYTES + 1).read_to_end(&mut bytes)?;
         ensure!(
@@ -215,7 +234,7 @@ pub(crate) fn baseline_metadata(
     let tags = nb
         .rows("api/dcim/cables/", "id,status,tags", Some(("site", site)))?
         .into_iter()
-        .map(|v| Ok((id(&v)?, v)))
+        .map(|v| Ok((i64::try_from(id(&v)?)?, v)))
         .collect::<Result<_>>()?;
     Ok(crate::baseline_inventory::Metadata {
         assets,
@@ -309,18 +328,6 @@ pub(crate) fn snapshot(url: &str, site: &str, token_file: &Path) -> Result<Snaps
             },
         });
     }
-    let terms = |v: &Value| -> Result<Vec<Termination>> {
-        v.as_array()
-            .context("missing cable terminations")?
-            .iter()
-            .map(|r| {
-                Ok(Termination {
-                    kind: str_value(&r["object_type"])?,
-                    id: r["object_id"].as_u64().context("missing termination ID")?,
-                })
-            })
-            .collect()
-    };
     let mut cables = Vec::new();
     for r in nb.rows(
         "api/dcim/cables/",
@@ -334,7 +341,7 @@ pub(crate) fn snapshot(url: &str, site: &str, token_file: &Path) -> Result<Snaps
             .any(|e| e.kind == "dcim.interface" && ids.contains(&e.id))
         {
             cables.push(Cable {
-                id: id(&r)?,
+                id: i64::try_from(id(&r)?)?,
                 status: status(&r["status"])?,
                 a,
                 b,
@@ -354,10 +361,328 @@ pub(crate) fn snapshot(url: &str, site: &str, token_file: &Path) -> Result<Snaps
     Ok(s)
 }
 
+fn terms(v: &Value) -> Result<Vec<Termination>> {
+    v.as_array()
+        .context("missing cable terminations")?
+        .iter()
+        .map(|r| {
+            Ok(Termination {
+                kind: str_value(&r["object_type"])?,
+                id: r["object_id"].as_u64().context("missing termination ID")?,
+            })
+        })
+        .collect()
+}
+
+fn breakout_links(
+    cable: &Cable,
+    rows: &[Value],
+    interfaces: &std::collections::BTreeMap<u64, Value>,
+) -> Result<Vec<Cable>> {
+    let ([local], [_, _]) = (cable.a.as_slice(), cable.b.as_slice()) else {
+        anyhow::bail!("invalid breakout terminations: #{}", cable.id);
+    };
+    ensure!(
+        local.kind == "dcim.interface" && cable.b.iter().all(|p| p.kind == "dcim.interface"),
+        "breakout must connect interfaces"
+    );
+    let parent = interfaces
+        .get(&local.id)
+        .context("missing breakout parent")?;
+    ensure!(
+        parent["channels"] == 2 && parent["enabled"] == true,
+        "invalid breakout parent channels"
+    );
+    let positions = rows
+        .iter()
+        .map(|r| {
+            Ok((
+                (
+                    r["cable_end"].as_str().context("missing cable end")?,
+                    r["connector"].as_u64().context("missing connector")?,
+                ),
+                r,
+            ))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    ensure!(
+        rows.len() == 3 && positions.len() == 3,
+        "invalid breakout connector count"
+    );
+    let local_position = positions
+        .get(&("A", 1))
+        .context("missing breakout parent connector")?;
+    ensure!(
+        local_position["termination_id"].as_u64() == Some(local.id)
+            && local_position["positions"] == serde_json::json!([1, 2]),
+        "breakout parent positions differ"
+    );
+    let children: Vec<_> = interfaces
+        .values()
+        .filter(|i| i["parent"]["id"].as_u64() == Some(local.id) && !i["channel_id"].is_null())
+        .collect();
+    ensure!(children.len() == 2, "expected two breakout child channels");
+    let mut links = Vec::with_capacity(2);
+    for side in 1..=2 {
+        let at = positions
+            .get(&("B", side))
+            .context("missing breakout peer connector")?;
+        let peer = at["termination_id"]
+            .as_u64()
+            .context("missing breakout peer ID")?;
+        ensure!(
+            at["positions"] == serde_json::json!([1]) && cable.b.iter().any(|b| b.id == peer),
+            "breakout peer position changed"
+        );
+        let channel = children
+            .iter()
+            .find(|i| i["channel_id"].as_u64() == Some(side))
+            .context("missing breakout channel")?;
+        ensure!(channel["enabled"] == true, "disabled breakout child");
+        // The signed key matches the prior publisher's per-channel membership.
+        let channel_key = cable
+            .id
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(side as i64))
+            .and_then(i64::checked_neg)
+            .context("invalid breakout cable ID")?;
+        links.push(Cable {
+            id: channel_key,
+            status: cable.status.clone(),
+            a: vec![Termination {
+                kind: "dcim.interface".into(),
+                id: id(channel)?,
+            }],
+            b: vec![Termination {
+                kind: "dcim.interface".into(),
+                id: peer,
+            }],
+        });
+    }
+    ensure!(
+        links[0].b[0].id != links[1].b[0].id,
+        "duplicate breakout peer connector"
+    );
+    Ok(links)
+}
+
+pub(crate) fn approved_snapshot(
+    url: &str,
+    site: &str,
+    token: &Path,
+    policy: &crate::policy::Policy,
+    cable_tag: &str,
+) -> Result<(Snapshot, crate::baseline_inventory::Metadata)> {
+    use std::collections::BTreeMap;
+    let nb = NetBox::new(url, token)?;
+    let sites = nb.rows("api/dcim/sites/", "id,slug", Some(("slug", site)))?;
+    ensure!(
+        sites.len() == 1 && sites[0]["slug"] == site,
+        "wrong NetBox site"
+    );
+    let s = Site {
+        id: id(&sites[0])?,
+        slug: site.into(),
+    };
+    let assets = nb
+        .rows(
+            "api/dcim/devices/",
+            "id,name,role,status,device_type,primary_ip4,oob_ip,site",
+            Some(("site", site)),
+        )?
+        .into_iter()
+        .map(|d| Ok((id(&d)?, d)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let devices = assets
+        .values()
+        .map(|d| {
+            ensure!(id(&d["site"])? == s.id, "device outside approved site");
+            Ok(Device {
+                id: id(d)?,
+                name: str_value(&d["name"])?,
+                role: str_value(&d["role"]["slug"])?,
+                status: status(&d["status"])?,
+                primary_ip4: address(&d["primary_ip4"])?,
+                oob_ip: address(&d["oob_ip"])?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows = nb
+        .rows(
+            "api/dcim/interfaces/",
+            "id,device,name,enabled,custom_fields,parent,channels,channel_id",
+            Some(("site", site)),
+        )?
+        .into_iter()
+        .map(|p| Ok((id(&p)?, p)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let interfaces = rows
+        .values()
+        .map(|p| {
+            let device_id = id(&p["device"])?;
+            ensure!(
+                assets.contains_key(&device_id),
+                "interface outside approved site"
+            );
+            Ok(Interface {
+                id: id(p)?,
+                device_id,
+                name: str_value(&p["name"])?,
+                enabled: p["enabled"]
+                    .as_bool()
+                    .context("missing interface enabled state")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (name, alias) in &policy.interface_aliases {
+        let (host, interface) = crate::baseline_ports::endpoint(name)?;
+        let Some(guid) = interface.strip_suffix("_1").filter(|g| {
+            g.len() == 16
+                && g.bytes().all(|c| c.is_ascii_hexdigit())
+                && host.to_ascii_uppercase().starts_with("B300-")
+        }) else {
+            continue;
+        };
+        let p = rows
+            .get(&alias.interface_id)
+            .context("missing GUID interface")?;
+        let reported = p["custom_fields"]["node_guid"]
+            .as_str()
+            .unwrap_or_default()
+            .replace(':', "")
+            .to_ascii_lowercase();
+        ensure!(
+            reported
+                .strip_prefix("0x")
+                .unwrap_or(&reported)
+                .eq_ignore_ascii_case(guid),
+            "NetBox HCA GUID changed: {name}"
+        );
+    }
+    let mut cables = Vec::new();
+    let mut tags = BTreeMap::new();
+    for c in nb.rows(
+        "api/dcim/cables/",
+        "id,status,tags,profile,a_terminations,b_terminations",
+        Some(("site", site)),
+    )? {
+        let base = Cable {
+            id: i64::try_from(id(&c)?)?,
+            status: status(&c["status"])?,
+            a: terms(&c["a_terminations"])?,
+            b: terms(&c["b_terminations"])?,
+        };
+        let links = if c["profile"]["value"] == "breakout-1c2p-2c1p"
+            && c["tags"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|t| t["slug"] == cable_tag))
+        {
+            let connectors = nb.rows(
+                "api/dcim/cable-terminations/",
+                "id,cable,cable_end,connector,positions,termination_id",
+                Some(("cable_id", &base.id.to_string())),
+            )?;
+            ensure!(
+                connectors
+                    .iter()
+                    .all(|t| t["cable"].as_i64() == Some(base.id)),
+                "wrong cable returned for breakout connector"
+            );
+            breakout_links(&base, &connectors, &rows)
+                .with_context(|| format!("expand breakout cable #{}", base.id))?
+        } else {
+            vec![base]
+        };
+        for cable in links {
+            ensure!(
+                tags.insert(cable.id, c.clone()).is_none(),
+                "duplicate cable key"
+            );
+            cables.push(cable);
+        }
+    }
+    let model_ids = assets
+        .values()
+        .filter(|v| v["role"]["slug"] == "gpu-server" && v["status"]["value"] == "active")
+        .map(|v| id(&v["device_type"]))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut gpu_types = BTreeMap::new();
+    for model in model_ids {
+        let mut u = nb.base.join(&format!("api/dcim/device-types/{model}/"))?;
+        u.query_pairs_mut()
+            .append_pair("fields", "id,slug,custom_fields");
+        let v: Value = nb.get(u)?;
+        ensure!(id(&v)? == model, "wrong GPU device type");
+        gpu_types.insert(model, v);
+    }
+    let snapshot = Snapshot {
+        schema_version: 1,
+        captured_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        site: s,
+        devices,
+        interfaces,
+        ip_addresses: Vec::new(),
+        cables,
+    };
+    snapshot.validate()?;
+    Ok((
+        snapshot,
+        crate::baseline_inventory::Metadata {
+            assets,
+            gpu_types,
+            tags,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn breakout_membership_tracks_connector_ids() -> Result<()> {
+        let interface = |id| Termination {
+            id,
+            kind: "dcim.interface".into(),
+        };
+        let cable = Cable {
+            id: 200,
+            status: "connected".into(),
+            a: vec![interface(10)],
+            b: vec![interface(21), interface(22)],
+        };
+        let interfaces = [
+            (10, json!({"id":10, "channels":2, "enabled":true})),
+            (
+                11,
+                json!({"id":11, "parent":{"id":10}, "channel_id":1, "enabled":true}),
+            ),
+            (
+                12,
+                json!({"id":12, "parent":{"id":10}, "channel_id":2, "enabled":true}),
+            ),
+        ]
+        .into();
+        let mut rows = [
+            json!({"cable_end":"A", "connector":1, "positions":[1,2], "termination_id":10}),
+            json!({"cable_end":"B", "connector":1, "positions":[1], "termination_id":22}),
+            json!({"cable_end":"B", "connector":2, "positions":[1], "termination_id":21}),
+        ];
+        let links = breakout_links(&cable, &rows, &interfaces)?;
+        assert_eq!(
+            (links[0].id, links[0].a[0].id, links[0].b[0].id),
+            (-2001, 11, 22)
+        );
+        assert_eq!(
+            (links[1].id, links[1].a[0].id, links[1].b[0].id),
+            (-2002, 12, 21)
+        );
+
+        rows[2]["termination_id"] = json!(22);
+        assert!(breakout_links(&cable, &rows, &interfaces).is_err());
+        Ok(())
+    }
+
     #[test]
     fn duplicate_ids_stop_snapshot() {
         assert!(

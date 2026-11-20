@@ -103,14 +103,14 @@ struct Status {
     probe_targets: Option<usize>,
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
-fn interval(s: &str) -> std::result::Result<Duration, String> {
+pub(crate) fn interval(s: &str) -> std::result::Result<Duration, String> {
     let (n, scale) = match s.as_bytes().last() {
         Some(b's') => (&s[..s.len() - 1], 1),
         Some(b'm') => (&s[..s.len() - 1], 60),
@@ -132,7 +132,7 @@ pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let dir = path.parent().context("missing state directory")?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     serde_json::to_writer_pretty(&mut file, value)?;

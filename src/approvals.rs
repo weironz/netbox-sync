@@ -37,7 +37,7 @@ struct PendingLink {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CableApproval {
-    cable: u64,
+    cable: i64,
     first: Option<u64>,
     #[serde(default)]
     monitoring: Mapping,

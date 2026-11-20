@@ -48,7 +48,7 @@ fn expand_behavior(value: &mut Json, replacements: &[(&str, &str)]) {
     }
 }
 
-fn job(job: &str) -> Result<(&str, Option<u16>, Option<&str>)> {
+pub(crate) fn job(job: &str) -> Result<(&str, Option<u16>, Option<&str>)> {
     match job {
         "b300-redfish" | "cpu-redfish" => Ok(("bmc", None, None)),
         "biz-ping" | "q3400-snmp" | "sonic-snmp" | "fortigate-snmp" => Ok(("primary", None, None)),

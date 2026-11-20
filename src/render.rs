@@ -86,7 +86,7 @@ fn seq<'a>(v: &'a Value, k: &str) -> Result<&'a Vec<Value>> {
     v[k].as_array().with_context(|| format!("missing list {k}"))
 }
 
-fn label_text(template: &str, fields: &[(&str, &str)]) -> Result<String> {
+pub(crate) fn label_text(template: &str, fields: &[(&str, &str)]) -> Result<String> {
     let mut rest = template;
     let mut out = String::new();
     while let Some((before, after)) = rest.split_once('{') {
