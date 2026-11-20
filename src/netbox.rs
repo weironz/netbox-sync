@@ -1,5 +1,5 @@
 use crate::model::*;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use reqwest::{
     Url,
     blocking::Client,
@@ -139,6 +139,22 @@ impl NetBox {
             .build()?;
         Ok(Self { base, client, auth })
     }
+    fn get<T: serde::de::DeserializeOwned>(&self, url: Url) -> Result<T> {
+        let response = self
+            .client
+            .get(url)
+            .header(AUTHORIZATION, self.auth.clone())
+            .send()?;
+        ensure!(response.status().is_success(), "HTTP {}", response.status());
+        let mut bytes = Vec::new();
+        response.take(MAX_PAGE_BYTES + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_PAGE_BYTES,
+            "API response is too large"
+        );
+        serde_json::from_slice(&bytes).context("decode NetBox JSON")
+    }
+
     fn rows(&self, path: &str, fields: &str, filter: Option<(&str, &str)>) -> Result<Vec<Value>> {
         collect_pages(|offset| {
             let mut u = self.base.join(path)?;
@@ -150,23 +166,9 @@ impl NetBox {
             if let Some((key, val)) = filter {
                 u.query_pairs_mut().append_pair(key, val);
             }
-            let response = self
-                .client
+            let p: Page = self
                 .get(u)
-                .header(AUTHORIZATION, self.auth.clone())
-                .send()
                 .with_context(|| format!("GET {path} at offset {offset}"))?;
-            if !response.status().is_success() {
-                bail!("GET {path} returned HTTP {}", response.status());
-            }
-            let mut buf = Vec::new();
-            response
-                .take(MAX_PAGE_BYTES + 1)
-                .read_to_end(&mut buf)
-                .context("read API page")?;
-            ensure!(buf.len() as u64 <= MAX_PAGE_BYTES, "API page too large");
-            let p: Page =
-                serde_json::from_slice(&buf).with_context(|| format!("decode {path} page"))?;
             ensure!(
                 p.next.is_none() || !p.results.is_empty(),
                 "empty intermediate API page"
@@ -175,6 +177,51 @@ impl NetBox {
         })
         .with_context(|| format!("incomplete snapshot from {path}"))
     }
+}
+
+pub(crate) fn baseline_metadata(
+    url: &str,
+    token: &Path,
+    snapshot: &Snapshot,
+) -> Result<crate::baseline_inventory::Metadata> {
+    use std::collections::BTreeMap;
+    let nb = NetBox::new(url, token)?;
+    let site = snapshot.site.slug.as_str();
+    let assets: BTreeMap<_, _> = nb
+        .rows(
+            "api/dcim/devices/",
+            "id,name,role,status,device_type,primary_ip4",
+            Some(("site", site)),
+        )?
+        .into_iter()
+        .map(|v| Ok((id(&v)?, v)))
+        .collect::<Result<_>>()?;
+    let model_ids = assets
+        .values()
+        .filter(|v| v["role"]["slug"] == "gpu-server" && v["status"]["value"] == "active")
+        .map(|v| id(&v["device_type"]))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut gpu_types = BTreeMap::new();
+    for model in model_ids {
+        let mut url = nb.base.join(&format!("api/dcim/device-types/{model}/"))?;
+        url.query_pairs_mut()
+            .append_pair("fields", "id,slug,custom_fields");
+        let data: Value = nb
+            .get(url)
+            .with_context(|| format!("read GPU device type #{model}"))?;
+        ensure!(id(&data)? == model, "NetBox returned the wrong device type");
+        gpu_types.insert(model, data);
+    }
+    let tags = nb
+        .rows("api/dcim/cables/", "id,status,tags", Some(("site", site)))?
+        .into_iter()
+        .map(|v| Ok((id(&v)?, v)))
+        .collect::<Result<_>>()?;
+    Ok(crate::baseline_inventory::Metadata {
+        assets,
+        gpu_types,
+        tags,
+    })
 }
 
 pub(crate) fn snapshot(url: &str, site: &str, token_file: &Path) -> Result<Snapshot> {

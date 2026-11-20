@@ -1,4 +1,11 @@
-use crate::{model::Snapshot, netbox, plan, policy::Policy, render};
+use crate::{
+    approvals::{self, Approvals},
+    baseline,
+    model::Snapshot,
+    netbox, plan,
+    policy::Policy,
+    render,
+};
 use anyhow::{Context, Result, ensure};
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -29,14 +36,34 @@ pub(crate) struct RunOptions {
         long,
         env = "NETBOX_INVENTORY_FILE",
         hide_env_values = true,
-        required_unless_present = "inventory_generator",
-        conflicts_with = "inventory_generator"
+        required_unless_present_any = ["inventory_generator", "approvals"],
+        conflicts_with_all = ["inventory_generator", "approvals"]
     )]
     inventory: Option<PathBuf>,
     /// Executable receiving the snapshot JSON path and returning inventory YAML on stdout.
     /// With --probe-only it returns the site, roles and target labels without resolving cables.
-    #[arg(long, env = "NETBOX_INVENTORY_GENERATOR", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "NETBOX_INVENTORY_GENERATOR",
+        hide_env_values = true,
+        conflicts_with = "approvals"
+    )]
     inventory_generator: Option<PathBuf>,
+    /// Render an inventory directly from monitoring approvals.
+    #[arg(long, env = "NETBOX_APPROVALS_FILE", hide_env_values = true)]
+    approvals: Option<PathBuf>,
+    #[arg(long, env = "NETBOX_BASELINE_INPUTS_DIR", requires_all = ["approvals","baseline_output_dir","prometheus_url"])]
+    baseline_inputs_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "NETBOX_BASELINE_OUTPUT_DIR",
+        requires = "baseline_inputs_dir"
+    )]
+    baseline_output_dir: Option<PathBuf>,
+    #[arg(long, env = "PROMETHEUS_URL")]
+    prometheus_url: Option<String>,
+    #[arg(long, env = "NETBOX_PROMTOOL", default_value = "/bin/promtool")]
+    promtool: PathBuf,
     #[arg(long, env = "NETBOX_POLICY_FILE", hide_env_values = true)]
     policy: PathBuf,
     #[arg(long, env = "NETBOX_RENDER_FILE", hide_env_values = true)]
@@ -97,7 +124,7 @@ fn interval(s: &str) -> std::result::Result<Duration, String> {
     }
 }
 
-fn sync_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
@@ -139,6 +166,8 @@ pub(crate) struct StatusOptions {
     output_dir: PathBuf,
     #[arg(long, env = "NETBOX_MAX_AGE", default_value = "3h", value_parser = interval)]
     max_age: Duration,
+    #[arg(long, env = "NETBOX_BASELINE_OUTPUT_DIR")]
+    baseline_output_dir: Option<PathBuf>,
 }
 
 pub(crate) fn status(opts: StatusOptions) -> Result<u8> {
@@ -146,15 +175,23 @@ pub(crate) fn status(opts: StatusOptions) -> Result<u8> {
         &fs::read(opts.output_dir.join("status.json")).context("read sync status")?,
     )?;
     println!("{}", serde_json::to_string_pretty(&s)?);
-    Ok(
-        if s.last_success
-            .is_some_and(|t| now().saturating_sub(t) <= opts.max_age.as_secs())
-        {
-            0
-        } else {
-            2
-        },
-    )
+    let fresh = |ts: u64| {
+        now()
+            .checked_sub(ts)
+            .is_some_and(|elapsed| elapsed <= opts.max_age.as_secs())
+    };
+    let target = s.last_success.is_some_and(fresh);
+    let baseline = match opts.baseline_output_dir {
+        Some(dir) => fs::read(dir.join("status.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|s| {
+                s.get("error").is_some_and(serde_json::Value::is_null)
+                    && s["last_success"].as_u64().is_some_and(fresh)
+            }),
+        None => true,
+    };
+    Ok(if target && baseline { 0 } else { 2 })
 }
 
 #[cfg(unix)]
@@ -208,7 +245,18 @@ fn publish(_: &Path, _: &render::Files) -> Result<String> {
     anyhow::bail!("managed file publication requires Linux")
 }
 
-fn generate_inventory(o: &RunOptions, snapshot: &Snapshot, probe_only: bool) -> Result<String> {
+fn generate_inventory(
+    o: &RunOptions,
+    snapshot: &Snapshot,
+    policy: &Policy,
+    probe_only: bool,
+) -> Result<String> {
+    if let Some(path) = &o.approvals {
+        let approvals: Approvals = approvals::load_yaml(path)?;
+        return Ok(serde_yaml_ng::to_string(
+            &approvals.project(snapshot, policy, probe_only)?,
+        )?);
+    }
     let program = o
         .inventory_generator
         .as_ref()
@@ -233,7 +281,11 @@ fn generate_inventory(o: &RunOptions, snapshot: &Snapshot, probe_only: bool) -> 
     String::from_utf8(output.stdout).context("inventory generator output is not UTF-8")
 }
 
-fn round(o: &RunOptions, s: &mut Status, fetch: impl FnOnce() -> Result<Snapshot>) -> Result<()> {
+fn round(
+    o: &RunOptions,
+    s: &mut Status,
+    fetch: impl FnOnce() -> Result<Snapshot>,
+) -> Result<Snapshot> {
     let snapshot = fetch().context("fetch NetBox snapshot")?;
     let legacy = o
         .inventory
@@ -250,7 +302,7 @@ fn round(o: &RunOptions, s: &mut Status, fetch: impl FnOnce() -> Result<Snapshot
         let inventory = match legacy.as_deref() {
             Some(text) => text,
             None => {
-                probe = generate_inventory(o, &snapshot, true)?;
+                probe = generate_inventory(o, &snapshot, &policy, true)?;
                 &probe
             }
         };
@@ -282,7 +334,7 @@ fn round(o: &RunOptions, s: &mut Status, fetch: impl FnOnce() -> Result<Snapshot
     }
     let inventory = match legacy {
         Some(text) => text,
-        None => generate_inventory(o, &snapshot, false)?,
+        None => generate_inventory(o, &snapshot, &policy, false)?,
     };
     let (mut report, candidate) = plan::build(&inventory, &snapshot, Some(&o.site), Some(&policy))?;
     if matches!(o.port_mode, PortMode::Off) {
@@ -315,15 +367,16 @@ fn round(o: &RunOptions, s: &mut Status, fetch: impl FnOnce() -> Result<Snapshot
     s.last_success = Some(now());
     s.generations = Some([prom_version, vm_version]);
     s.files_verified = Some(prom.len() + vm.len());
-    Ok(())
+    Ok(snapshot)
 }
 
 pub(crate) fn run(o: RunOptions) -> Result<u8> {
-    let paths = [
+    let mut paths = vec![
         &o.output_dir,
         &o.prometheus_publish_dir,
         &o.vmagent_publish_dir,
     ];
+    paths.extend(o.baseline_output_dir.iter());
     for (i, p) in paths.iter().enumerate() {
         let p = p
             .canonicalize()
@@ -366,8 +419,48 @@ pub(crate) fn run(o: RunOptions) -> Result<u8> {
                 state.files_verified.unwrap_or_default()
             );
         }
+        let mut baseline_ok = true;
+        if let (Some(inputs), Some(output)) = (&o.baseline_inputs_dir, &o.baseline_output_dir) {
+            let rules = (|| -> Result<serde_json::Value> {
+                let snapshot = outcome
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!("synchronization failed: {e:#}"))?;
+                let approvals: Approvals = approvals::load_yaml(
+                    o.approvals.as_deref().context("missing native approvals")?,
+                )?;
+                let policy = approvals::load_yaml(&o.policy)?;
+                let metadata = netbox::baseline_metadata(&o.netbox_url, &o.token_file, snapshot)?;
+                let previous = baseline::read_membership(&output.join("current/membership.json"))?;
+                let (files, mut report) = baseline::compile(
+                    inputs,
+                    &approvals,
+                    snapshot,
+                    &policy,
+                    &metadata,
+                    previous.as_ref(),
+                )?;
+                let generation = baseline::publish(
+                    output,
+                    &files,
+                    &o.promtool,
+                    o.prometheus_url
+                        .as_deref()
+                        .context("missing Prometheus URL")?,
+                )?;
+                report["generation"] = serde_json::json!(generation);
+                report["last_success"] = serde_json::json!(now());
+                report["error"] = serde_json::Value::Null;
+                Ok(report)
+            })();
+            baseline_ok = rules.is_ok();
+            let report = rules.unwrap_or_else(
+                |e| serde_json::json!({"error":format!("{e:#}"),"last_attempt":now()}),
+            );
+            atomic_json(&output.join("status.json"), &report)?;
+            println!("{report}");
+        }
         if o.once {
-            return Ok(if outcome.is_ok() { 0 } else { 2 });
+            return Ok(if outcome.is_ok() && baseline_ok { 0 } else { 2 });
         }
         thread::sleep(o.interval);
     }

@@ -50,6 +50,7 @@ jobs:
             --label "org.opencontainers.image.version=${TAG#v}" \
             --tag "$image" artifact/runtime
           test "$(docker run --rm --network none --read-only --cap-drop ALL "$image" --version)" = "netbox-sync ${TAG#v}"
+          docker run --rm --network none --read-only --cap-drop ALL --entrypoint /bin/promtool "$image" --version
           docker image inspect "$image" --format '{{.Id}}' > artifact/image-id.txt
       - name: Publish to Docker Hub
         env:

@@ -1,3 +1,8 @@
+mod approvals;
+mod baseline;
+mod baseline_inventory;
+mod baseline_ports;
+mod baseline_rules;
 mod daemon;
 mod model;
 mod netbox;
@@ -24,7 +29,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Continuously validate and publish approved device targets.
-    Run(daemon::RunOptions),
+    Run(Box<daemon::RunOptions>),
     /// Print persisted status and fail when no recent valid sync exists.
     Status(daemon::StatusOptions),
     /// Read NetBox and save a minimal site snapshot. Does not modify NetBox.
@@ -36,6 +41,34 @@ enum Commands {
         #[arg(long, env = "NETBOX_TOKEN_FILE", hide_env_values = true)]
         token_file: PathBuf,
         #[arg(long, env = "NETBOX_SNAPSHOT_FILE", hide_env_values = true)]
+        output: PathBuf,
+    },
+    /// Render an approved monitoring inventory from a saved snapshot.
+    Inventory {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long, env = "NETBOX_APPROVALS_FILE")]
+        approvals: PathBuf,
+        #[arg(long, env = "NETBOX_POLICY_FILE")]
+        policy: PathBuf,
+        #[arg(long)]
+        probe_only: bool,
+    },
+    /// Render rule files to a new directory without updating a running Prometheus.
+    BaselinePreview {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        metadata: PathBuf,
+        #[arg(long, env = "NETBOX_APPROVALS_FILE")]
+        approvals: PathBuf,
+        #[arg(long, env = "NETBOX_POLICY_FILE")]
+        policy: PathBuf,
+        #[arg(long, env = "NETBOX_BASELINE_INPUTS_DIR")]
+        inputs: PathBuf,
+        #[arg(long)]
+        membership: Option<PathBuf>,
+        #[arg(long)]
         output: PathBuf,
     },
     /// Compare a snapshot with inventory.yml; output a report and, if equivalent, a candidate.
@@ -70,7 +103,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 fn run(c: Cli) -> Result<u8> {
     match c.command {
-        Commands::Run(o) => daemon::run(o),
+        Commands::Run(o) => daemon::run(*o),
         Commands::Status(o) => daemon::status(o),
         Commands::Snapshot {
             netbox_url,
@@ -88,6 +121,52 @@ fn run(c: Cli) -> Result<u8> {
                 s.ip_addresses.len(),
                 s.cables.len()
             );
+            Ok(0)
+        }
+        Commands::Inventory {
+            snapshot,
+            approvals,
+            policy,
+            probe_only,
+        } => {
+            let snapshot = serde_json::from_slice(&fs::read(snapshot)?)?;
+            let approvals: approvals::Approvals = approvals::load_yaml(&approvals)?;
+            let policy = approvals::load_yaml(&policy)?;
+            let inventory = approvals.project(&snapshot, &policy, probe_only)?;
+            print!("{}", serde_yaml_ng::to_string(&inventory)?);
+            Ok(0)
+        }
+        Commands::BaselinePreview {
+            snapshot,
+            metadata,
+            approvals,
+            policy,
+            inputs,
+            membership,
+            output,
+        } => {
+            let snapshot = serde_json::from_slice(&fs::read(snapshot)?)?;
+            let metadata = serde_json::from_slice(&fs::read(metadata)?)?;
+            let approvals = approvals::load_yaml(&approvals)?;
+            let policy = approvals::load_yaml(&policy)?;
+            let membership = membership
+                .as_deref()
+                .map(baseline::read_membership)
+                .transpose()?
+                .flatten();
+            let (files, result) = baseline::compile(
+                &inputs,
+                &approvals,
+                &snapshot,
+                &policy,
+                &metadata,
+                membership.as_ref(),
+            )?;
+            fs::create_dir(&output)?;
+            for (name, bytes) in files {
+                write_new(&output.join(name), &bytes)?;
+            }
+            println!("{}", serde_json::to_string(&result)?);
             Ok(0)
         }
         Commands::Plan {

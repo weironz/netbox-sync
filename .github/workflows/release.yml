@@ -48,6 +48,7 @@ jobs:
             --label "org.opencontainers.image.version=${TAG#v}" \
             --tag "$image" .
           test "$(docker run --rm --network none --read-only --cap-drop ALL "$image" --version)" = "netbox-sync ${TAG#v}"
+          docker run --rm --network none --read-only --cap-drop ALL --entrypoint /bin/promtool "$image" --version
           mkdir -p dist
           cid=$(docker create "$image")
           trap 'docker rm -v "$cid" >/dev/null' EXIT
