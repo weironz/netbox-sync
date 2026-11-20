@@ -1,0 +1,172 @@
+{
+  "inventory_integrity": {
+    "name": "monitoring-inventory-integrity",
+    "rules": [
+      {
+        "alert": "MonitoringInventoryBaselineMissing",
+        "expr": "absent(monitoring:expected:devices) or absent(monitoring:expected:gpus) or absent(monitoring:expected:ib_links)",
+        "for": "10m",
+        "labels": {
+          "severity": "critical"
+        },
+        "annotations": {
+          "summary": "在用设备基线记录缺失，检查 inventory.yml 生成与加载状态"
+        }
+      },
+      {
+        "alert": "MonitoringExpectedTargetMissing",
+        "expr": "monitoring:expected:target unless on(instance,target_job) label_replace(up, \"target_job\", \"$1\", \"job\", \"(.+)\")",
+        "for": "10m",
+        "labels": {
+          "severity": "warning"
+        },
+        "annotations": {
+          "summary": "{{ $labels.host }} 的 {{ $labels.target_job }} 目标从采集序列中消失",
+          "description": "目标来自在用设备配置；其他设备或重复序列不会抵消本设备缺失。先核对服务发现及采集链路。"
+        }
+      },
+      {
+        "alert": "PortBaselineMissing",
+        "expr": "absent(monitoring:port_baseline:enabled)",
+        "for": "5m",
+        "labels": {
+          "severity": "critical",
+          "site": "__SITE__"
+        },
+        "annotations": {
+          "summary": "端口基线规则缺失，请检查 inventory.yml 的生成与加载"
+        }
+      }
+    ]
+  },
+  "port": [
+    {
+      "name": "declared-port-baseline",
+      "interval": "1m",
+      "rules": [
+        {
+          "record": "monitoring:port:status",
+          "expr": "(monitoring:port:inventory * on(source_job,source_instance,source_ifName) group_left() (max by(source_job,source_instance,source_ifName)(label_replace((label_replace((label_replace(((max by(job,instance,ifName)(ifOperStatus{job=~\"q3400-snmp|sonic-snmp|fortigate-snmp\"}) == bool 1) and on(job,instance,ifName) (time() - max by(job,instance,ifName)(timestamp(ifOperStatus{job=~\"q3400-snmp|sonic-snmp|fortigate-snmp\"})) < __FRESHNESS__) and on(job,instance) ((max by(job,instance)(up{job=~\"q3400-snmp|sonic-snmp|fortigate-snmp\"}) == 1) and on(job,instance) (time() - max by(job,instance)(timestamp(up{job=~\"q3400-snmp|sonic-snmp|fortigate-snmp\"})) < __FRESHNESS__))),\"source_job\",\"$1\",\"job\",\"(.+)\")),\"source_instance\",\"$1\",\"instance\",\"(.+)\")),\"source_ifName\",\"$1\",\"ifName\",\"(.+)\")))) or on(job,instance,ifName) (-1 * monitoring:port:inventory)"
+        },
+        {
+          "record": "monitoring:link:status",
+          "expr": "monitoring:link:expected * on(site,link_id) group_left() min by(site,link_id)(monitoring:port:status{expected=\"up\"})"
+        },
+        {
+          "record": "monitoring:port:role_up",
+          "expr": "sum by(site,network,device,port_role)(monitoring:port:status{expected=\"up\"} == bool 1) or on(site,device,port_role) (0 * monitoring:port:role_expected)"
+        },
+        {
+          "record": "monitoring:port:role_down",
+          "expr": "sum by(site,network,device,port_role)(monitoring:port:status{expected=\"up\"} == bool 0) or on(site,device,port_role) (0 * monitoring:port:role_expected)"
+        },
+        {
+          "record": "monitoring:port:role_unknown",
+          "expr": "sum by(site,network,device,port_role)(monitoring:port:status{expected=\"up\"} < bool 0) or on(site,device,port_role) (0 * monitoring:port:role_expected)"
+        },
+        {
+          "record": "monitoring:port:role_pending",
+          "expr": "count by(site,network,device,port_role)(monitoring:port:inventory{expected=\"up\",review=\"peer_pending\"}) or on(site,device,port_role) (0 * monitoring:port:role_expected)"
+        }
+      ]
+    },
+    {
+      "name": "declared-link-alerts",
+      "rules": [
+        {
+          "alert": "PortExpectedLinkDown",
+          "expr": "monitoring:link:status{review!=\"planned\"} == 0",
+          "for": "5m",
+          "labels": {
+            "severity": "critical",
+            "host": "{{ $labels.a_device }}",
+            "ifName": "{{ $labels.a_port }}",
+            "peer": "{{ $labels.b_device }}/{{ $labels.b_port }}"
+          },
+          "annotations": {
+            "summary": "{{ $labels.site }} 链路 down：{{ $labels.a_device }} {{ $labels.a_port }} ↔ {{ $labels.b_device }} {{ $labels.b_port }}",
+            "description": "inventory.yml 声明应在线，SNMP 新鲜且接口非 up，持续 5 分钟。一条物理链路只报一次；采集失败/过期单独报未知。role={{ $labels.port_role }} link_id={{ $labels.link_id }}。",
+            "dashboard_url": "{{ if eq $labels.network \"firewall\" }}__DASHBOARD_ROOT__/d/fortigate-snmp{{ else if eq $labels.network \"ethernet\" }}__DASHBOARD_ROOT__/d/sonic-snmp{{ else }}__DASHBOARD__{{ end }}"
+          }
+        },
+        {
+          "alert": "PortPlannedLinkDown",
+          "expr": "monitoring:link:status{review=\"planned\"} == 0",
+          "for": "5m",
+          "labels": {
+            "severity": "warning",
+            "host": "{{ $labels.a_device }}",
+            "ifName": "{{ $labels.a_port }}",
+            "peer": "{{ $labels.b_device }}/{{ $labels.b_port }}"
+          },
+          "annotations": {
+            "summary": "{{ $labels.site }} 规划连接 down，需核实在用情况：{{ $labels.a_device }} {{ $labels.a_port }} ↔ {{ $labels.b_device }} {{ $labels.b_port }}",
+            "description": "规划要求在线但本次未能通过对端发现确认接线；仍计入期望并展示 down。先核实历史停用或真实断链，确认在用后升级到正式链路告警。两端按 link_id 去重。"
+          }
+        },
+        {
+          "alert": "PortTelemetryUnknown",
+          "expr": "sum by(site,device)(monitoring:port:role_unknown) > 0",
+          "for": "5m",
+          "labels": {
+            "severity": "warning",
+            "host": "{{ $labels.device }}"
+          },
+          "annotations": {
+            "summary": "{{ $labels.site }} {{ $labels.device }} 有 {{ $value }} 个在用端口状态未知",
+            "description": "采集失败、样本过期或接口序列缺失。按设备汇总，避免误报为大量断链。"
+          }
+        }
+      ]
+    }
+  ],
+  "firewall": [
+    {
+      "name": "declared-firewall-boundaries",
+      "interval": "1m",
+      "rules": [
+        {
+          "record": "monitoring:firewall:link",
+          "expr": "max by(site,link_id)(monitoring:port:inventory{network=\"firewall\",expected=\"up\"})"
+        },
+        {
+          "record": "monitoring:internet:ingress_bps",
+          "expr": "monitoring:internet:interface * on(instance,ifName) group_left() ((max by(instance,ifName)(rate(ifHCInOctets{job=\"fortigate-snmp\"}[5m])) * 8) and on(instance,ifName) (time() - max by(instance,ifName)(timestamp(ifHCInOctets{job=\"fortigate-snmp\"})) < __FRESHNESS__) and on(instance) ((max by(instance)(up{job=\"fortigate-snmp\"}) == 1) and on(instance) (time() - max by(instance)(timestamp(up{job=\"fortigate-snmp\"})) < __FRESHNESS__)))"
+        },
+        {
+          "record": "monitoring:internet:ingress_total_bps",
+          "expr": "sum by(site,edge)(monitoring:internet:ingress_bps) and on(site,edge) (count by(site,edge)(monitoring:internet:ingress_bps) == on(site,edge) count by(site,edge)(monitoring:internet:interface))"
+        },
+        {
+          "record": "monitoring:internet:egress_bps",
+          "expr": "monitoring:internet:interface * on(instance,ifName) group_left() ((max by(instance,ifName)(rate(ifHCOutOctets{job=\"fortigate-snmp\"}[5m])) * 8) and on(instance,ifName) (time() - max by(instance,ifName)(timestamp(ifHCOutOctets{job=\"fortigate-snmp\"})) < __FRESHNESS__) and on(instance) ((max by(instance)(up{job=\"fortigate-snmp\"}) == 1) and on(instance) (time() - max by(instance)(timestamp(up{job=\"fortigate-snmp\"})) < __FRESHNESS__)))"
+        },
+        {
+          "record": "monitoring:internet:egress_total_bps",
+          "expr": "sum by(site,edge)(monitoring:internet:egress_bps) and on(site,edge) (count by(site,edge)(monitoring:internet:egress_bps) == on(site,edge) count by(site,edge)(monitoring:internet:interface))"
+        },
+        {
+          "record": "monitoring:internet:telemetry_missing",
+          "expr": "count by(site,edge)(monitoring:internet:interface) - on(site,edge) (count by(site,edge)(monitoring:internet:ingress_bps and on(site,edge,device,instance,ifName) monitoring:internet:egress_bps) or on(site,edge) (0 * count by(site,edge)(monitoring:internet:interface)))"
+        }
+      ]
+    },
+    {
+      "name": "declared-firewall-alerts",
+      "rules": [
+        {
+          "alert": "InternetTrafficTelemetryMissing",
+          "expr": "monitoring:internet:telemetry_missing > 0",
+          "for": "5m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "{{ $labels.site }} {{ $labels.edge }} 流量采集不完整",
+            "description": "缺失或过期时显示暂无数据，不用零或部分端口流量冒充 IDC 总流量。"
+          }
+        }
+      ]
+    }
+  ]
+}

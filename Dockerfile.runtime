@@ -1,4 +1,7 @@
+FROM prom/prometheus@sha256:69f5241418838263316593f7274a304b095c40bcf22e57272865da91bd60a8ac AS prometheus
+
 FROM scratch
+COPY --from=prometheus /bin/promtool /bin/promtool
 COPY netbox-sync /netbox-sync
 WORKDIR /work
 USER 65532:65532

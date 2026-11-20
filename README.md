@@ -97,3 +97,9 @@ require_oob_roles: [server]
 别名要同时匹配站点、NetBox ID 和预期名称，输出继续用原监控标签。配置业务标签的角色必须有且仅有一个绑定在启用接口上的 active IPv4；缺失或歧义会拦截候选。要求 OOB 的角色必须有一个与设备 OOB 地址相符的 active IPv4 绑定。`plan.json` 的 `resolved_devices` 记录选出的地址，供与现网逐项核对；工具不把新字段自动加到已有清单，也不会应用候选。`snapshot` 保存 NetBox IP 的状态及标签。
 
 `interface_aliases` 用于同一设备上的端口命名差异。键是库存中的 `设备/接口`，值固定到 NetBox 设备 ID、接口 ID 和接口名。匹配要求目标接口启用，且该映射与其他清单端口或已存在的同名接口无冲突。身份校验失败时，链路报告为 `invalid_interface_alias`。对账仍检查两端的实际线缆；端口别名不改写库存、采集配置或端口规则。
+
+### Native approvals and baseline publication
+
+Set `NETBOX_APPROVALS_FILE` to a site approvals file to generate the monitored inventory inside the Rust process. Existing inventory-file integrations remain supported. To enable rule publication, also set `NETBOX_BASELINE_INPUTS_DIR`, `NETBOX_BASELINE_OUTPUT_DIR`, and `PROMETHEUS_URL`. The official Linux image contains `/bin/promtool` for validating the four generated rule files before replacing `current` and requesting a Prometheus reload. A previous approved generation must already exist in the output directory. The native status check covers both target synchronization and baseline publication when the baseline directory is configured.
+
+Use `netbox-sync inventory --help` and `netbox-sync baseline-preview --help` to review the inventory and rules from a saved snapshot and asset metadata before deployment.
